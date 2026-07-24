@@ -1,12 +1,12 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * PageChat Radio Pro — Server v3.3 (Crash-Protected)
+ * Wave 🌊 — Lighthouse Server v1.0 (Crash-Protected)
  * ═══════════════════════════════════════════════════════════
  * Stack: Node.js + Express + Socket.io
  * License: AGPL-3.0
  * 
- * The server NEVER hears your voice.
- * Audio flows P2P via WebRTC. Server only handles signaling.
+ * The server NEVER hears your voice and NEVER stores files.
+ * Audio and Files flow P2P via WebRTC. Server only handles signaling.
  */
 
 'use strict';
@@ -15,10 +15,92 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
+
+// Путь к файлу сохранения состояния каналов
+const SAVE_FILE = path.join(__dirname, 'channels-backup.json');
+
+// ═══════════════════════════════════════════════════════════
+// PERSISTENCE (Сохранение каналов на диск)
+// ═══════════════════════════════════════════════════════════
+
+function saveChannels() {
+  try {
+    const data = [];
+    channels.forEach((ch, id) => {
+      data.push({
+        id: ch.id,
+        name: ch.name,
+        admin: ch.admin,
+        adminName: ch.adminName,
+        requireApproval: ch.requireApproval,
+        totalLikes: ch.totalLikes || 0,
+        created: ch.created,
+        messages: ch.messages || [],
+        // ✅ ВАЖНО: сохраняем ТОЛЬКО метаданные файлов (без содержимого)
+        chest: (ch.chest || []).map(file => ({
+          id: file.id,
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          uploader: file.uploader,
+          uploaderName: file.uploaderName,
+          timestamp: file.timestamp
+        }))
+      });
+    });
+    
+    fs.writeFileSync(SAVE_FILE, JSON.stringify(data, null, 2), 'utf8');
+    //console.log(`💾 Saved ${data.length} channel(s) to disk`);
+  } catch (err) {
+    console.error('❌ Failed to save channels:', err.message);
+  }
+}
+
+function loadChannels() {
+  try {
+    if (!fs.existsSync(SAVE_FILE)) {
+      console.log('📂 No backup file found, starting fresh');
+      return;
+    }
+    const data = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8'));
+    data.forEach(ch => {
+      // Восстанавливаем канал с пустыми Map/Set
+      channels.set(ch.id, {
+        ...ch,
+        speakers: new Map(),
+        listeners: new Map(),
+        joinRequests: new Map(),
+        raisedHands: new Set(),
+        recentlyApproved: new Map(),
+        userLikes: new Map(),
+        deleteTimer: null
+      });
+    });
+    console.log(`✅ Loaded ${data.length} channel(s) from backup`);
+  } catch (err) {
+    console.error('❌ Failed to load channels:', err.message);
+  }
+}
+
+// Авто-сохранение каждые 60 секунд
+setInterval(saveChannels, 60000);
 
 // ═══════════════════════════════════════════════════════════
 // ГЛОБАЛЬНАЯ ЗАЩИТА ОТ ПАДЕНИЙ
 // ═══════════════════════════════════════════════════════════
+
+function gracefulShutdown(signal) {
+  log('🛑', `Shutdown signal: ${signal}. Saving state...`);
+  saveChannels();
+  try { io.close(); } catch(e) {}
+  try { server.close(); } catch(e) {}
+  setTimeout(() => {
+    console.log('👋 Server stopped gracefully.');
+    process.exit(0);
+  }, 1000);
+}
 
 process.on('uncaughtException', (err) => {
   console.error('🔥 UNCAUGHT EXCEPTION (server continues):', err.message);
@@ -29,15 +111,9 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('🔥 UNHANDLED REJECTION (server continues):', reason);
 });
 
+// ✅ Объединенные обработчики сигналов (исправлен конфликт дубликатов)
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-function gracefulShutdown(signal) {
-  log('🛑', `Shutdown signal: ${signal}`);
-  try { io.close(); } catch(e) {}
-  try { server.close(); } catch(e) {}
-  setTimeout(() => process.exit(0), 1000);
-}
 
 // ═══════════════════════════════════════════════════════════
 // APP SETUP
@@ -56,7 +132,7 @@ const io = new Server(server, {
   },
   pingTimeout: 60000,
   pingInterval: 25000,
-  maxHttpBufferSize: 2e5
+  maxHttpBufferSize: 250e6 // ✅ 250 МБ (с запасом для Base64 от 150 МБ файла)
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -69,7 +145,7 @@ const CONFIG = {
   apiKey: process.env.API_KEY || '',
   limits: {
     MAX_CHANNELS: 1000,
-    MAX_CHANNELS_PER_USER: 5,
+    MAX_CHANNELS_PER_USER: 1,
     MAX_SPEAKERS: 10,
     MAX_LISTENERS: 30,
     MAX_USERS: 40,
@@ -81,7 +157,8 @@ const CONFIG = {
     MAX_CHANNEL_NAME_LENGTH: 30,
     MESSAGE_HISTORY: 200,
     REQUEST_EXPIRY: 5 * 60 * 1000,
-    MAX_PAYLOAD_SIZE: 200000
+    // ✅ 200 МБ достаточно для метаданных и чата. Это предотвращает DDoS.
+    MAX_PAYLOAD_SIZE: 200_000_000 
   },
   security: {
     MAX_CONNECTIONS_PER_IP: 10,
@@ -155,7 +232,6 @@ function securityLog(event, details) {
   }
 }
 
-// ✅ Универсальный safe-handler: ловит ВСЕ ошибки в обработчиках
 function safeHandler(name, fn) {
   return async (...args) => {
     try {
@@ -226,23 +302,23 @@ app.get('/', (req, res) => {
   try {
     let ts = 0, tl = 0;
     channels.forEach(ch => { ts += ch.speakers.size; tl += ch.listeners.size; });
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PageChat Radio Pro</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#09090b;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:40px 20px}.c{max-width:480px;width:100%}.h{text-align:center;margin-bottom:28px}.h h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,#6366f1,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}.sb{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:20px;font-size:12px;color:#10b981;font-weight:600}.sd{width:7px;height:7px;background:#10b981;border-radius:50%;animation:p 2s infinite}@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}.cd{background:#111114;border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:22px;margin-bottom:14px}.cd h2{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:rgba(250,250,250,.4);margin-bottom:14px;font-weight:700}.sg{display:grid;grid-template-columns:1fr 1fr;gap:10px}.st{background:#1a1a1f;border-radius:10px;padding:14px;text-align:center}.sv{font-size:22px;font-weight:800}.sl{font-size:10px;color:rgba(250,250,250,.4);margin-top:3px;text-transform:uppercase}.ll{list-style:none}.ll li{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px}.ll li:last-child{border-bottom:none}.ll .lb{color:rgba(250,250,250,.6)}.ll .vl{font-weight:700;font-family:monospace}.ub{background:#1a1a1f;border:1px solid rgba(99,102,241,.3);border-radius:10px;padding:14px;text-align:center;font-family:monospace;font-size:12px;color:#6366f1;word-break:break-all}.ft{text-align:center;font-size:10px;color:rgba(250,250,250,.25);margin-top:20px}</style></head>
-<body><div class="c"><div class="h"><h1>PageChat Radio Pro</h1><div class="sb"><div class="sd"></div>Server Online v3.3</div></div>
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wave 🌊 Lighthouse</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#09090b;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:40px 20px}.c{max-width:480px;width:100%}.h{text-align:center;margin-bottom:28px}.h h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,#00b4d8,#0077b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}.sb{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:20px;font-size:12px;color:#10b981;font-weight:600}.sd{width:7px;height:7px;background:#10b981;border-radius:50%;animation:p 2s infinite}@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}.cd{background:#111114;border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:22px;margin-bottom:14px}.cd h2{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:rgba(250,250,250,.4);margin-bottom:14px;font-weight:700}.sg{display:grid;grid-template-columns:1fr 1fr;gap:10px}.st{background:#1a1a1f;border-radius:10px;padding:14px;text-align:center}.sv{font-size:22px;font-weight:800}.sl{font-size:10px;color:rgba(250,250,250,.4);margin-top:3px;text-transform:uppercase}.ll{list-style:none}.ll li{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px}.ll li:last-child{border-bottom:none}.ll .lb{color:rgba(250,250,250,.6)}.ll .vl{font-weight:700;font-family:monospace}.ub{background:#1a1a1f;border:1px solid rgba(0,180,216,.3);border-radius:10px;padding:14px;text-align:center;font-family:monospace;font-size:12px;color:#00b4d8;word-break:break-all}.ft{text-align:center;font-size:10px;color:rgba(250,250,250,.25);margin-top:20px}</style></head>
+<body><div class="c"><div class="h"><h1>Wave 🌊 Lighthouse</h1><div class="sb"><div class="sd"></div>Server Online v1.0</div></div>
 <div class="cd"><h2>Live Statistics</h2><div class="sg">
 <div class="st"><div class="sv">${channels.size}</div><div class="sl">Channels</div></div>
 <div class="st"><div class="sv">${users.size}</div><div class="sl">Online</div></div>
-<div class="st"><div class="sv">${ts}</div><div class="sl">Speakers</div></div>
-<div class="st"><div class="sv">${tl}</div><div class="sl">Listeners</div></div></div></div>
+<div class="st"><div class="sv">${ts}</div><div class="sl">Navigators</div></div>
+<div class="st"><div class="sv">${tl}</div><div class="sl">Travelers</div></div></div></div>
 <div class="cd"><h2>Configuration</h2><ul class="ll">
 <li><span class="lb">Max channels</span><span class="vl">${CONFIG.limits.MAX_CHANNELS}</span></li>
-<li><span class="lb">Speakers / channel</span><span class="vl">${CONFIG.limits.MAX_SPEAKERS}</span></li>
-<li><span class="lb">Listeners / channel</span><span class="vl">${CONFIG.limits.MAX_LISTENERS}</span></li>
+<li><span class="lb">Navigators / channel</span><span class="vl">${CONFIG.limits.MAX_SPEAKERS}</span></li>
+<li><span class="lb">Travelers / channel</span><span class="vl">${CONFIG.limits.MAX_LISTENERS}</span></li>
 <li><span class="lb">Total / channel</span><span class="vl">${CONFIG.limits.MAX_USERS}</span></li>
 <li><span class="lb">Ban duration</span><span class="vl">30 min</span></li>
 <li><span class="lb">Connections / IP</span><span class="vl">${CONFIG.security.MAX_CONNECTIONS_PER_IP}</span></li></ul></div>
 <div class="cd"><h2>Connection URL</h2><div class="ub">ws://${req.headers.host}</div></div>
-<div class="ft">PageChat Radio Pro v3.3 — P2P Voice. Server never hears you.</div></div></body></html>`);
+<div class="ft">Wave v1.0 — P2P Voice & Files. Server never hears or stores your data.</div></div></body></html>`);
   } catch (err) {
     console.error('❌ HTTP / error:', err);
     res.status(500).send('Server error');
@@ -298,6 +374,7 @@ setInterval(() => {
         if (target) {
           try { io.to(target.socketId).emit('join-request-expired', { channelId: channel.id }); } catch(e) {}
         }
+        try { io.to(channel.id).emit('join-request-removed', { userId }); } catch(e) {}
       });
       if (expired.length > 0) log('🧹', `Expired ${expired.length} request(s) in "${channel.name}"`);
     });
@@ -305,6 +382,42 @@ setInterval(() => {
     console.error('❌ Periodic expiry error:', err.message);
   }
 }, 60000);
+
+// ═══════════════════════════════════════════════════════════
+// AUTO-DELETION SYSTEM (24 часа неактивности)
+// ═══════════════════════════════════════════════════════════
+function scheduleChannelDeletion(channelId) {
+  const channel = channels.get(channelId);
+  if (!channel) return;
+  
+  if (channel.deleteTimer) {
+    clearTimeout(channel.deleteTimer);
+  }
+  
+  channel.deleteTimer = setTimeout(() => {
+    const ch = channels.get(channelId);
+    if (ch && ch.speakers.size === 0 && ch.listeners.size === 0) {
+      channels.delete(channelId);
+      bans.delete(channelId);
+      channelSpeaking.delete(channelId);
+      channelScreenShare.delete(channelId);
+      channelLikes.delete(channelId);
+      io.emit('channels-updated');
+      log('🗑️', `Channel "${ch.name}" auto-deleted after 24h of inactivity`);
+    }
+  }, 24 * 60 * 60 * 1000);
+  
+  log('⏳', `Channel "${channel.name}" scheduled for deletion in 24h`);
+}
+
+function cancelChannelDeletion(channelId) {
+  const channel = channels.get(channelId);
+  if (channel && channel.deleteTimer) {
+    clearTimeout(channel.deleteTimer);
+    channel.deleteTimer = null;
+    log('🔄', `Channel "${channel.name}" deletion timer cancelled (activity detected)`);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════
 // SOCKET.IO — MAIN HANDLER
@@ -316,7 +429,6 @@ io.on('connection', (socket) => {
 
   log('🔌', `Socket connected: ${socket.id}`);
 
-  // ── REGISTER PERSISTENT ID ──
   socket.on('register-persistent', safeHandler('register-persistent', (rawData, cb) => {
     const data = safeData(rawData);
     const persistentId = sanitize(data.persistentId, 40);
@@ -333,6 +445,150 @@ io.on('connection', (socket) => {
     socket._registered = true;
     cb({ success: true, userId: persistentId });
     log('✅', `Registered: ${socket.id} → ${persistentId}`);
+  }));
+  
+  // ── CHEST: Add File (ТОЛЬКО метаданные) ──
+  socket.on('chest-add-file', safeHandler('chest-add-file', (rawData, cb) => {
+    const callback = typeof cb === 'function' ? cb : () => {};
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData || !userData.channelId) return callback({ error: 'Not in channel' });
+    
+    const channel = channels.get(userData.channelId);
+    if (!channel) return callback({ error: 'Channel not found' });
+    
+    const metadata = data.metadata;
+    if (!metadata || !metadata.id || !metadata.name) return callback({ error: 'Invalid metadata' });
+    
+    // ✅ СЕРВЕРНАЯ ПРОВЕРКА: защита от подделки размера файла клиентом
+    if (metadata.size > 150 * 1024 * 1024) {
+      return callback({ error: 'File exceeds 150MB limit' });
+    }
+    
+    if (!channel.chest) channel.chest = [];
+    
+    channel.chest.push({
+      id: metadata.id,
+      name: metadata.name,
+      size: metadata.size,
+      type: metadata.type,
+      uploader: userData.userId,
+      uploaderName: userData.userName,
+      timestamp: metadata.timestamp || Date.now()
+    });
+    
+    if (channel.chest.length > 20) {
+      const removed = channel.chest.shift();
+      console.log(`[Chest] Old file removed: ${removed.name}`);
+    }
+    
+    io.to(userData.channelId).emit('chest-updated', channel.chest);
+    log('🎁', `${userData.userName} added treasure to "${channel.name}"`);
+    callback({ success: true });
+  }));
+
+  // ── CHEST: Request File (сигнализация для P2P) ──
+  socket.on('chest-request-file', safeHandler('chest-request-file', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData || !userData.channelId) return;
+    
+    const channel = channels.get(userData.channelId);
+    if (!channel || !channel.chest) return;
+    
+    const file = channel.chest.find(f => f.id === data.fileId);
+    if (!file) return;
+    
+    const owner = findUser(file.uploader);
+    if (!owner) {
+      socket.emit('chest-file-unavailable', { fileId: data.fileId, reason: 'Owner offline' });
+      return;
+    }
+    
+    io.to(owner.socketId).emit('chest-file-requested', {
+      fileId: data.fileId,
+      requesterId: userData.userId,
+      requesterName: userData.userName,
+      requesterSocketId: socket.id
+    });
+  }));
+
+  // ── CHEST: File Ready ──
+  socket.on('chest-file-ready', safeHandler('chest-file-ready', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    
+    const requester = findUser(data.requesterId);
+    if (requester) {
+      io.to(requester.socketId).emit('chest-file-ready', {
+        fileId: data.fileId,
+        ownerSocketId: socket.id,
+        ownerName: userData.userName
+      });
+    }
+  }));
+  
+  // ── CHANNEL: Leave ──
+  socket.on('leave-channel', safeHandler('leave-channel', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    
+    const channelId = data.channelId || userData.channelId;
+    const channel = channels.get(channelId);
+    if (!channel) return;
+    
+    const name = channel.speakers.get(userData.userId)?.name || 
+                 channel.listeners.get(userData.userId)?.name || 
+                 userData.userName;
+    
+    channel.speakers.delete(userData.userId);
+    channel.listeners.delete(userData.userId);
+    channel.raisedHands.delete(userData.userId);
+    if (channel.joinRequests) channel.joinRequests.delete(userData.userId);
+    if (channel.recentlyApproved) channel.recentlyApproved.delete(userData.userId);
+    channelSpeaking.get(channelId)?.delete(userData.userId);
+    channelScreenShare.get(channelId)?.delete(userData.userId);
+    
+    socket.leave(channelId);
+    userData.channelId = null;
+    userData.role = null;
+    
+    socket.to(channelId).emit('user-left', { userId: userData.userId, userName: name });
+    
+    if (channel.speakers.size === 0 && channel.listeners.size === 0) {
+      scheduleChannelDeletion(channelId);
+    }
+    
+    log('👋', `${name} left "${channel.name}" explicitly`);
+  }));
+
+  // ── CALL ──
+  socket.on('call-user', safeHandler('call-user', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    
+    const channel = channels.get(userData.channelId);
+    if (!channel) return;
+    
+    const targetUserId = data.targetUserId;
+    if (targetUserId === userData.userId) return;
+    
+    const target = findUser(targetUserId);
+    if (!target) return;
+    
+    const targetData = users.get(target.socketId);
+    if (targetData && targetData.isMuted) return;
+    
+    io.to(target.socketId).emit('incoming-call', {
+      fromUserId: userData.userId,
+      fromUserName: userData.userName,
+      timestamp: Date.now()
+    });
+    
+    socket.emit('call-sent', { targetUserId, targetUserName: target.userName });
   }));
 
   // Rate limiter + security
@@ -356,6 +612,10 @@ io.on('connection', (socket) => {
 
   // ── CHANNEL: Create ──
   socket.on('create-channel', safeHandler('create-channel', (rawData, cb) => {
+    const callback = typeof cb === 'function' ? cb : () => { 
+      console.log('[WARN] Client called create-channel without callback'); 
+    };
+    
     const data = safeData(rawData);
     const userId = socket._userId;
     const channelName = sanitize(data.channelName, CONFIG.limits.MAX_CHANNEL_NAME_LENGTH);
@@ -363,9 +623,9 @@ io.on('connection', (socket) => {
 
     let userCount = 0;
     channels.forEach(ch => { if (ch.admin === userId) userCount++; });
-    if (channels.size >= CONFIG.limits.MAX_CHANNELS) return cb({ error: 'Server limit reached' });
-    if (userCount >= CONFIG.limits.MAX_CHANNELS_PER_USER) return cb({ error: `Limit: ${CONFIG.limits.MAX_CHANNELS_PER_USER} per user` });
-    if (!channelName) return cb({ error: 'Name required' });
+    if (channels.size >= CONFIG.limits.MAX_CHANNELS) return callback({ error: 'Server limit reached' });
+    if (userCount >= CONFIG.limits.MAX_CHANNELS_PER_USER) return callback({ error: `Limit: ${CONFIG.limits.MAX_CHANNELS_PER_USER} per user` });
+    if (!channelName) return callback({ error: 'Name required' });
 
     const channelId = uuidv4().slice(0, 8).toUpperCase();
     channels.set(channelId, {
@@ -376,43 +636,47 @@ io.on('connection', (socket) => {
       joinRequests: new Map(), raisedHands: new Set(),
       recentlyApproved: new Map(),
       userLikes: new Map(), totalLikes: 0,
-      created: Date.now()
+      created: Date.now(),
+      chest: [],
+      deleteTimer: null
     });
     bans.set(channelId, { users: new Map(), ips: new Map() });
     users.set(socket.id, { userId, userName, channelId, role: 'admin' });
     socket.join(channelId);
 
-    log('📢', `Created: "${channelName}" (${channelId}) by ${userName}`);
-    cb({ success: true, channelId });
+    log('📢', `Created: "${channelName}" (${channelId}) by ${userName} [ID: ${userId}]`);
+    callback({ success: true, channelId });
     io.emit('channels-updated');
+    saveChannels(); // ✅ Сохраняем при создании
   }));
 
   // ── CHANNEL: Join ──
   socket.on('join-channel', safeHandler('join-channel', (rawData, cb) => {
+    const callback = typeof cb === 'function' ? cb : () => {};
     const data = safeData(rawData);
     const userId = socket._userId;
     const userName = sanitize(data.userName, CONFIG.limits.MAX_NAME_LENGTH) || 'Anonymous';
     const channelId = sanitize(data.channelId, 20);
     const channel = channels.get(channelId);
-    if (!channel) return cb({ error: 'Channel not found' });
+    if (!channel) return callback({ error: 'Channel not found' });
 
     const channelBans = bans.get(channelId);
     if (channelBans) {
       if (channelBans.users && channelBans.users.has(userId)) {
         const until = channelBans.users.get(userId);
-        if (Date.now() < until) return cb({ error: `Banned. ${Math.ceil((until - Date.now()) / 60000)} min left` });
+        if (Date.now() < until) return callback({ error: `Banned. ${Math.ceil((until - Date.now()) / 60000)} min left` });
         channelBans.users.delete(userId);
       }
       const ip = socket._clientIp;
       if (channelBans.ips && channelBans.ips.has(ip)) {
         const until = channelBans.ips.get(ip);
-        if (Date.now() < until) return cb({ error: `Banned (IP). ${Math.ceil((until - Date.now()) / 60000)} min left` });
+        if (Date.now() < until) return callback({ error: `Banned (IP). ${Math.ceil((until - Date.now()) / 60000)} min left` });
         channelBans.ips.delete(ip);
       }
     }
 
     const total = channel.speakers.size + channel.listeners.size;
-    if (total >= CONFIG.limits.MAX_USERS) return cb({ error: `Full (${CONFIG.limits.MAX_USERS} max)` });
+    if (total >= CONFIG.limits.MAX_USERS) return callback({ error: `Full (${CONFIG.limits.MAX_USERS} max)` });
 
     let role = 'listener';
     if (channel.admin === userId) role = 'admin';
@@ -424,7 +688,7 @@ io.on('connection', (socket) => {
     if (role === 'admin' || role === 'speaker') channel.speakers.set(userId, { userId, name: uniqueName, socketId: socket.id });
     else channel.listeners.set(userId, { name: uniqueName, socketId: socket.id });
 
-    users.set(socket.id, { userId, userName: uniqueName, channelId, role });
+    users.set(socket.id, { userId, userName: uniqueName, channelId, role, isMuted: false });
     socket.join(channelId);
 
     const speakersList = Array.from(channel.speakers.entries()).map(([uid, s]) => ({ userId: uid, name: s.name }));
@@ -439,8 +703,8 @@ io.on('connection', (socket) => {
       userId: uid, userName: req.userName, timestamp: req.timestamp
     })) : [];
 
-    cb({
-      success: true, channelName: channel.name, isAdmin: role === 'admin', role,
+    callback({
+      success: true, channelName: channel.name, isAdmin: role === 'admin', role, requireApproval: channel.requireApproval,
       adminId: channel.admin, speakers: speakersList, listeners: listenersList,
       messages: channel.messages.slice(-100),
       maxSpeakers: CONFIG.limits.MAX_SPEAKERS, maxListeners: CONFIG.limits.MAX_LISTENERS,
@@ -448,15 +712,22 @@ io.on('connection', (socket) => {
       userLikes: Object.fromEntries(channel.userLikes || new Map()),
       totalLikes: channel.totalLikes || 0,
       raisedHands: raisedHandsList,
-      joinRequests: joinRequestsList
+      joinRequests: joinRequestsList,
+      chestFiles: channel.chest || []
     });
-
+	
+    cancelChannelDeletion(channelId);
     socket.to(channelId).emit('user-joined', { userId, userName: uniqueName, role });
     if (nameChanged) socket.emit('name-changed-by-server', { newName: uniqueName, reason: 'Name taken' });
     log('👤', `${uniqueName} → "${channel.name}" as ${role} [${total + 1}/${CONFIG.limits.MAX_USERS}]`);
   }));
+  
+  socket.on('mute-status', safeHandler('mute-status', (data) => {
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    userData.isMuted = data.isMuted || false;
+  }));
 
-  // ── CHANNEL: List ──
   socket.on('get-channels', safeHandler('get-channels', (cb) => {
     const list = [];
     channels.forEach((ch, id) => {
@@ -465,7 +736,6 @@ io.on('connection', (socket) => {
     cb(list);
   }));
 
-  // ── CHANNEL: Join Request ──
   socket.on('request-join', safeHandler('request-join', (rawData, cb) => {
     const data = safeData(rawData);
     const userId = socket._userId;
@@ -473,9 +743,7 @@ io.on('connection', (socket) => {
     const channel = channels.get(channelId);
     if (!channel) return cb({ error: 'Channel not found' });
 
-    if (channel.admin === userId) return cb({ approved: true });
-    if (channel.speakers.has(userId)) return cb({ approved: true });
-    if (channel.listeners.has(userId)) return cb({ approved: true });
+    if (channel.admin === userId || channel.speakers.has(userId) || channel.listeners.has(userId)) return cb({ approved: true });
 
     if (channel.recentlyApproved && channel.recentlyApproved.has(userId)) {
       const expiresAt = channel.recentlyApproved.get(userId);
@@ -484,7 +752,6 @@ io.on('connection', (socket) => {
     }
 
     if (!channel.requireApproval) return cb({ approved: true });
-
     if (channel.joinRequests.has(userId)) return cb({ approved: false, message: 'Request already pending' });
 
     channel.joinRequests.set(userId, {
@@ -501,7 +768,6 @@ io.on('connection', (socket) => {
     cb({ approved: false, message: 'Request sent to admin' });
   }));
 
-  // ── CHANNEL: Respond to Join Request ──
   socket.on('respond-join-request', safeHandler('respond-join-request', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -537,12 +803,10 @@ io.on('connection', (socket) => {
     }
 
     try { io.to(userData.channelId).emit('join-request-removed', { userId: data.targetUserId }); } catch(e) {}
-
     log(data.approved ? '✅' : '❌', `Join ${data.approved ? 'approved' : 'denied'}: ${request.userName} in "${channel.name}"`);
     cb({ success: true });
   }));
 
-  // ── GET JOIN REQUESTS ──
   socket.on('get-join-requests', safeHandler('get-join-requests', (rawData, cb) => {
     const userData = users.get(socket.id);
     if (!userData) return cb([]);
@@ -555,7 +819,6 @@ io.on('connection', (socket) => {
     cb(list);
   }));
 
-  // ── GET RAISED HANDS ──
   socket.on('get-raised-hands', safeHandler('get-raised-hands', (rawData, cb) => {
     const userData = users.get(socket.id);
     if (!userData) return cb([]);
@@ -570,7 +833,6 @@ io.on('connection', (socket) => {
     cb(list);
   }));
 
-  // ── CHANNEL: Switch ──
   socket.on('switch-channel', safeHandler('switch-channel', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -587,31 +849,56 @@ io.on('connection', (socket) => {
     socket.join(newId);
     userData.channelId = newId;
 
+    cancelChannelDeletion(newId);
+
+    if (oldId && oldId !== newId) {
+       const oldChannel = channels.get(oldId);
+       if (oldChannel && oldChannel.speakers.size === 0 && oldChannel.listeners.size === 0) {
+          scheduleChannelDeletion(oldId);
+       }
+    }
+
     let role = 'listener';
     if (newChannel.admin === userData.userId) role = 'admin';
     else if (newChannel.speakers.has(userData.userId)) role = 'speaker';
     userData.role = role;
 
     try { socket.to(newId).emit('user-back', { userId: userData.userId, userName: userData.userName, role }); } catch(e) {}
-    cb({ success: true, channelId: newId, role });
+    cb({ success: true, chestFiles: newChannel.chest || [], channelId: newId, role });
   }));
 
-  // ── TEXT CHAT ──
   socket.on('send-message', safeHandler('send-message', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
     if (!userData || !checkMessageRate(userData.userId)) return;
     const channel = channels.get(userData.channelId);
     if (!channel) return;
+    
     const text = sanitize(data.text, CONFIG.limits.MAX_MESSAGE_LENGTH);
     if (!text) return;
-    const msg = { id: uuidv4().slice(0, 10), userId: userData.userId, userName: userData.userName, text, timestamp: Date.now() };
+    
+    const msg = { 
+      id: uuidv4().slice(0, 10), 
+      userId: userData.userId, 
+      userName: userData.userName, 
+      text, 
+      timestamp: Date.now() 
+    };
+    
+    if (data.replyTo && typeof data.replyTo === 'object') {
+      msg.replyTo = {
+        id: sanitize(data.replyTo.id, 20),
+        userId: sanitize(data.replyTo.userId, 40),
+        userName: sanitize(data.replyTo.userName, CONFIG.limits.MAX_NAME_LENGTH),
+        text: sanitize(data.replyTo.text, 200)
+      };
+    }
+    
     channel.messages.push(msg);
     if (channel.messages.length > CONFIG.limits.MESSAGE_HISTORY) channel.messages.shift();
     io.to(userData.channelId).emit('new-message', msg);
   }));
 
-  // ── USER: Rename ──
   socket.on('update-username', safeHandler('update-username', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -632,7 +919,6 @@ io.on('connection', (socket) => {
     if (nameChanged) socket.emit('name-changed-by-server', { newName: uniqueName, reason: 'Name taken' });
   }));
 
-  // ── USER: Make Speaker ──
   socket.on('make-speaker', safeHandler('make-speaker', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -645,7 +931,6 @@ io.on('connection', (socket) => {
 
     channel.listeners.delete(data.targetUserId);
     channel.speakers.set(data.targetUserId, { userId: data.targetUserId, name: listener.name, socketId: listener.socketId });
-
     channel.raisedHands.delete(data.targetUserId);
 
     const target = findUser(data.targetUserId);
@@ -653,12 +938,10 @@ io.on('connection', (socket) => {
 
     io.to(userData.channelId).emit('role-changed', { userId: data.targetUserId, role: 'speaker', userName: listener.name });
     io.to(userData.channelId).emit('hand-lowered', { userId: data.targetUserId });
-
     log('🎤', `${listener.name} → speaker in "${channel.name}"`);
     cb({ success: true });
   }));
 
-  // ── USER: Remove Speaker ──
   socket.on('remove-speaker', safeHandler('remove-speaker', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -680,7 +963,6 @@ io.on('connection', (socket) => {
     cb({ success: true });
   }));
 
-  // ── USER: Kick ──
   socket.on('kick-user', safeHandler('kick-user', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -701,7 +983,6 @@ io.on('connection', (socket) => {
     cb({ success: true });
   }));
 
-  // ── USER: Ban ──
   socket.on('ban-user', safeHandler('ban-user', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -728,7 +1009,6 @@ io.on('connection', (socket) => {
     cb({ success: true });
   }));
 
-  // ── USER: Transfer Admin ──
   socket.on('transfer-admin', safeHandler('transfer-admin', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -749,7 +1029,6 @@ io.on('connection', (socket) => {
     cb({ success: true });
   }));
 
-  // ── SPEAKING STATUS ──
   socket.on('speaking-status', safeHandler('speaking-status', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -761,7 +1040,6 @@ io.on('connection', (socket) => {
     socket.to(chId).emit('user-speaking', { userId: userData.userId, userName: userData.userName, isSpeaking: !!data.isSpeaking });
   }));
 
-  // ── SCREEN SHARE / CAMERA ──
   socket.on('screen-share-start', safeHandler('screen-share-start', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -780,7 +1058,6 @@ io.on('connection', (socket) => {
     socket.to(userData.channelId).emit('screen-share-stopped', { userId: userData.userId });
   }));
 
-  // ── REQUEST STREAM RESEND ──
   socket.on('request-stream-resend', safeHandler('request-stream-resend', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -790,14 +1067,12 @@ io.on('connection', (socket) => {
     try { io.to(targetUser.socketId).emit('stream-resend-requested', { requesterId: userData.userId, requesterSocketId: socket.id }); } catch(e) {}
   }));
 
-  // ── TYPING ──
   socket.on('typing', safeHandler('typing', (data) => {
     const userData = users.get(socket.id);
     if (!userData) return;
     socket.to(userData.channelId).emit('user-typing', { userId: userData.userId, userName: userData.userName, isTyping: !!data.isTyping });
   }));
 
-  // ── RAISE HAND ──
   socket.on('raise-hand', safeHandler('raise-hand', () => {
     const userData = users.get(socket.id);
     if (!userData) return;
@@ -823,7 +1098,24 @@ io.on('connection', (socket) => {
     }
   }));
 
-  // ── LIKES ──
+  socket.on('deny-raised-hand', safeHandler('deny-raised-hand', (rawData, cb) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    const channel = channels.get(userData?.channelId);
+    if (!channel) return cb({ error: 'Not found' });
+    if (channel.admin !== userData.userId) return cb({ error: 'Admin only' });
+    if (!data.targetUserId) return cb({ error: 'Missing targetUserId' });
+
+    if (!channel.raisedHands.has(data.targetUserId)) {
+      try { io.to(userData.channelId).emit('hand-lowered', { userId: data.targetUserId }); } catch(e) {}
+      return cb({ success: true });
+    }
+
+    channel.raisedHands.delete(data.targetUserId);
+    io.to(userData.channelId).emit('hand-lowered', { userId: data.targetUserId });
+    cb({ success: true });
+  }));
+
   socket.on('send-like', safeHandler('send-like', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -844,7 +1136,6 @@ io.on('connection', (socket) => {
     }
   }));
 
-  // ── VOTE TO KICK ──
   socket.on('start-vote', safeHandler('start-vote', (rawData, cb) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -901,12 +1192,10 @@ io.on('connection', (socket) => {
     }
   }
 
-  // ── WEBRTC SIGNALING ──
   socket.on('webrtc-offer', safeHandler('webrtc-offer', (d) => { const t = findUser(d.toUserId); if (t) io.to(t.socketId).emit('webrtc-offer', d); }));
   socket.on('webrtc-answer', safeHandler('webrtc-answer', (d) => { const t = findUser(d.toUserId); if (t) io.to(t.socketId).emit('webrtc-answer', d); }));
   socket.on('webrtc-ice', safeHandler('webrtc-ice', (d) => { const t = findUser(d.toUserId); if (t) io.to(t.socketId).emit('webrtc-ice', d); }));
 
-  // ── BOT API ──
   socket.on('bot-auth', safeHandler('bot-auth', (rawData, cb) => {
     const data = safeData(rawData);
     if (!CONFIG.security.BOT_TOKENS.includes(data.token)) { securityLog('BOT_AUTH_FAIL', { ip: socket._clientIp }); return cb({ error: 'Invalid token' }); }
@@ -976,13 +1265,7 @@ io.on('connection', (socket) => {
       channelScreenShare.get(userData.channelId)?.delete(userData.userId);
 
       if (channel.speakers.size === 0 && channel.listeners.size === 0) {
-        channels.delete(userData.channelId);
-        bans.delete(userData.channelId);
-        channelSpeaking.delete(userData.channelId);
-        channelScreenShare.delete(userData.channelId);
-        channelLikes.delete(userData.channelId);
-        io.emit('channels-updated');
-        log('🗑️', `"${channel.name}" destroyed [${channels.size} active]`);
+        scheduleChannelDeletion(userData.channelId);
       } else {
         socket.to(userData.channelId).emit('user-left', { userId: userData.userId, userName: userData.userName });
       }
@@ -995,7 +1278,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── CHANNEL: Close (Admin only) ── ✅ ВНУТРИ io.on('connection')
+  // ── CHANNEL: Close (Admin only) ──
   socket.on('close-channel', safeHandler('close-channel', (rawData, cb) => {
     const userData = users.get(socket.id);
     if (!userData) return cb({ error: 'Not connected' });
@@ -1007,12 +1290,10 @@ io.on('connection', (socket) => {
     const channelName = channel.name;
     const channelId = userData.channelId;
     
-    // Собираем всех пользователей (кроме админа)
     const allUsers = [];
     channel.speakers.forEach((s, uid) => { if (uid !== userData.userId) allUsers.push(uid); });
     channel.listeners.forEach((l, uid) => { if (uid !== userData.userId) allUsers.push(uid); });
     
-    // Уведомляем ВСЕХ гостей что канал закрыт
     allUsers.forEach(uid => {
       const target = findUser(uid);
       if (target) {
@@ -1026,7 +1307,6 @@ io.on('connection', (socket) => {
       }
     });
     
-    // Удаляем всех из socket room и очищаем их состояние
     allUsers.forEach(uid => {
       const target = findUser(uid);
       if (target) {
@@ -1042,28 +1322,52 @@ io.on('connection', (socket) => {
       }
     });
     
-    // Полная очистка канала
+    if (channel.deleteTimer) {
+      clearTimeout(channel.deleteTimer);
+    }
+    
     channels.delete(channelId);
     bans.delete(channelId);
     channelSpeaking.delete(channelId);
     channelScreenShare.delete(channelId);
     channelLikes.delete(channelId);
     
-    // Удаляем связанные голоса
     votes.forEach((v, vid) => {
       if (v.channelId === channelId) votes.delete(vid);
     });
     
-    // Админ остаётся онлайн но без канала
     userData.channelId = null;
     userData.role = null;
     socket.leave(channelId);
     
     io.emit('channels-updated');
-    
     log('🚪', `Channel "${channelName}" closed by admin ${userData.userName}. Kicked ${allUsers.length} user(s)`);
     
     cb({ success: true, kicked: allUsers.length });
+    saveChannels(); // ✅ Сохраняем при закрытии
+  }));
+  
+  socket.on('toggle-channel-approval', safeHandler('toggle-channel-approval', (rawData, cb) => {
+    const userData = users.get(socket.id);
+    if (!userData) return cb({ error: 'Not connected' });
+    
+    const channel = channels.get(userData.channelId);
+    if (!channel) return cb({ error: 'Channel not found' });
+    if (channel.admin !== userData.userId) return cb({ error: 'Admin only' });
+    
+    channel.requireApproval = !channel.requireApproval;
+    const newMode = channel.requireApproval;
+    const modeText = newMode ? 'closed (approval required)' : 'open (free entry)';
+    
+    log('🔐', `${userData.userName} set "${channel.name}" to ${modeText}`);
+    
+    io.to(userData.channelId).emit('channel-mode-changed', {
+      requireApproval: newMode,
+      changedBy: userData.userName,
+      timestamp: Date.now()
+    });
+    
+    cb({ success: true, requireApproval: newMode });
   }));
 
 });  // ← ЗАКРЫТИЕ io.on('connection')
@@ -1072,24 +1376,29 @@ io.on('connection', (socket) => {
 // START
 // ═══════════════════════════════════════════════════════════
 
+// Загружаем каналы из бэкапа перед запуском
+loadChannels();
+
 server.listen(CONFIG.port, CONFIG.host, () => {
   console.log('');
   console.log('  ┌─────────────────────────────────────────────────┐');
-  console.log('  │   PageChat Radio Pro — Server v3.3 (Protected)  │');
+  console.log('  │           Wave 🌊 Lighthouse Server             │');
+  console.log('  │           v1.0 (Crash-Protected)                │');
   console.log('  └─────────────────────────────────────────────────┘');
   console.log('');
   console.log(`  Port:         ${CONFIG.port}`);
   console.log(`  Channels:     ${CONFIG.limits.MAX_CHANNELS} max`);
-  console.log(`  Per channel:  ${CONFIG.limits.MAX_SPEAKERS} speakers / ${CONFIG.limits.MAX_LISTENERS} listeners`);
+  console.log(`  Per channel:  ${CONFIG.limits.MAX_SPEAKERS} navigators / ${CONFIG.limits.MAX_LISTENERS} travelers`);
   console.log(`  Per IP:       ${CONFIG.security.MAX_CONNECTIONS_PER_IP} connections`);
   console.log(`  Rate:         ${CONFIG.security.MAX_EVENTS_PER_SECOND} events/sec`);
-  console.log(`  Payload:      ${CONFIG.limits.MAX_PAYLOAD_SIZE / 1024}KB max`);
+  console.log(`  Payload:      ${CONFIG.limits.MAX_PAYLOAD_SIZE / 1024}KB max (Metadata only)`);
   console.log(`  API Key:      ${CONFIG.apiKey ? 'ENABLED' : 'DISABLED (open)'}`);
   console.log('');
   console.log(`  Status:       http://localhost:${CONFIG.port}`);
   console.log(`  Client:       ws://YOUR_IP:${CONFIG.port}`);
   console.log('');
   console.log('  🛡️  Crash protection: ENABLED');
-  console.log('  Voice is P2P. Server never hears you.');
+  console.log('  💾 Auto-save: Every 60 seconds');
+  console.log('  🌊 Voice & Files are P2P. Server never hears or stores your data.');
   console.log('');
 });
