@@ -1,0 +1,68 @@
+# Additional allowed CORS origins.
+# Leave empty unless you know you need it.
+ALLOWED_ORIGINS=
+
+# ─────────────────────────────────────────────
+# Federation (Lighthouse Network)
+# ─────────────────────────────────────────────
+
+# Unique ID of THIS server in the federation.
+# Generate a unique value for every server.
+FEDERATION_ID=server-8F4C2A91
+
+# IMPORTANT:
+# Your PUBLIC hostname or IP address on port 3001.
+# This is the address OTHER federation servers will use
+# to connect to your node.
+#
+# Examples:
+# ws://your-domain.com:3001
+# ws://203.0.113.25:3001
+FEDERATION_URL=ws://YOUR_PUBLIC_IP_OR_DOMAIN:3001
+
+# Human-readable server name shown to other federation nodes.
+FEDERATION_NAME=My Pi2Pi Lighthouse
+
+# Federation shared secret.
+#
+# Every server that should join the SAME federation
+# must use the EXACT same secret.
+#
+# Generate a strong random value.
+FEDERATION_SECRET=4b2f97d8e1a45f8d90cb6c3471fd93be5aa8162c50b7f3d89fe74ac18e2607d1
+
+# Optional manually configured peers.
+# Comma separated.
+#
+# Example:
+# ws://server-one.com:3001,ws://server-two.com:3001
+FEDERATION_PEERS=
+
+# Bootstrap server.
+#
+# Specify ONE already-running federation node.
+# Your server will connect to it, discover additional peers,
+# and automatically expand its peer list.
+#
+# Leave empty if this is the first node in a new federation.
+FEDERATION_BOOTSTRAP=
+
+# IDs of servers you fully trust.
+#
+# Normally this should contain ONLY your own infrastructure.
+# Do NOT add public volunteer servers here.
+OFFICIAL_SERVER_IDS=server-8F4C2A91
+
+# Federation limits
+FEDERATION_MAX_PEERS=40
+FEDERATION_MAX_CONN_PER_IP=3
+FEDERATION_MAX_MSG_SIZE=65536
+
+# ─────────────────────────────────────────────
+# TURN (optional)
+# ─────────────────────────────────────────────
+
+# Only required if users experience problems
+# establishing direct peer-to-peer media connections.
+TURN_SECRET=
+TURN_URLS=
