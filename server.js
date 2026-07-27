@@ -824,20 +824,25 @@ io.on('connection', (socket) => {
   }));
 
   socket.on('send-message', safeHandler('send-message', (rawData) => {
-	if (!channel.messages) channel.messages = [];
     const data = safeData(rawData);
     const userData = users.get(socket.id);
     if (!userData || !checkMessageRate(userData.userId)) return;
-    const channel = channels.get(userData.channelId);
+    
+    const channel = channels.get(userData.channelId); // ✅ Сначала получаем канал
     if (!channel) return;
+    
+    if (!channel.messages) channel.messages = []; // ✅ Теперь channel определён, это безопасно
+    
     const text = sanitize(data.text, CONFIG.limits.MAX_MESSAGE_LENGTH);
     if (!text && !data.encrypted && !data.meta) return;
+    
     const msg = { id: uuidv4().slice(0, 10), userId: userData.userId, userName: userData.userName, text: text || '', timestamp: Date.now() };
     if (data.encrypted) msg.encrypted = data.encrypted;
     if (data.replyTo && typeof data.replyTo === 'object') {
       msg.replyTo = { id: sanitize(data.replyTo.id, 20), userId: sanitize(data.replyTo.userId, 40), userName: sanitize(data.replyTo.userName, 20), text: sanitize(data.replyTo.text, 200) };
     }
     if (data.meta) msg.meta = data.meta;
+    
     channel.messages.push(msg);
     if (channel.messages.length > CONFIG.limits.MESSAGE_HISTORY) channel.messages.shift();
     io.to(userData.channelId).emit('new-message', msg);
@@ -1241,6 +1246,32 @@ io.on('connection', (socket) => {
       federation.broadcastChannelUpdated(channel);
     } catch (err) { console.error('❌ disconnect:', err); }
   });
+  
+    // ═══════════════════════════════════════════════════════════
+    // FEDERATION PEERS DISCOVERY (для клиентского failover)
+    // ═══════════════════════════════════════════════════════════
+    socket.on('get-federation-peers', safeHandler('get-federation-peers', (cb) => {
+      if (typeof cb !== 'function') return;
+      const fedStatus = federation.getStatus();
+      const peers = [{
+        serverId: fedStatus.serverId,
+        serverName: fedStatus.serverName,
+        url: fedStatus.serverUrl,
+        isSelf: true,
+        trust: fedStatus.isOfficial ? 'official' : 'volunteer'
+      }];
+      // Добавляем подключённых пиров
+      (fedStatus.peers || []).forEach(p => {
+        peers.push({
+          serverId: p.serverId,
+          serverName: p.serverName,
+          url: p.url,
+          isSelf: false,
+          trust: p.trust || 'unknown'
+        });
+      });
+      cb({ success: true, peers, selfUrl: fedStatus.serverUrl });
+    }));
 
 }); 
 
