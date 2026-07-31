@@ -28,7 +28,7 @@ function timingSafeEqual(a, b) {
   try { return crypto.timingSafeEqual(bufA, bufB); } catch (e) { return false; }
 }
 
-// ✅ SECURITY FIX: HMAC challenge-response вместо raw secret
+// SECURITY FIX: HMAC challenge-response вместо raw secret
 function makeAuthToken(serverId, secret) {
   const ts = Math.floor(Date.now() / 1000);
   const hmac = crypto.createHmac('sha256', secret).update(`${ts}:${serverId}`).digest('hex');
@@ -84,6 +84,12 @@ class Federation {
     
     this._nameCheckCallbacks = new Map();
     this.peers = new Map();
+	
+    // ═══════════════════════════════════════════════════════════
+    // STUN FEDERATION REGISTRY
+    // ═══════════════════════════════════════════════════════════
+    this.globalStunServers = new Map(); // url -> {url, serverId, serverName, trust, lastUpdate}
+    this.localStunUrls = new Set();
     
     this.stats = {
       messagesSent: 0,
@@ -129,7 +135,7 @@ class Federation {
   // FEDERATION SERVER (входящие соединения)
   // ═══════════════════════════════════════════════════════════
   _startFederationServer() {
-    // ✅ SECURITY FIX: корректный парсинг порта через new URL()
+    //  SECURITY FIX: корректный парсинг порта через new URL()
     let fedPort;
     try {
       fedPort = parseInt(new URL(this.serverUrl).port) || 3001;
@@ -141,7 +147,7 @@ class Federation {
       port: fedPort,
       host: '0.0.0.0',
       maxPayload: this.maxFedMessageSize,
-      perMessageDeflate: false // ✅ SECURITY FIX: защита от zip-bomb
+      perMessageDeflate: false //  SECURITY FIX: защита от zip-bomb
     });
 
     this.wss.on('connection', (ws, req) => {
@@ -252,7 +258,7 @@ class Federation {
       const ws = new WebSocket(url, {
         handshakeTimeout: opts.probe ? 5000 : 10000,
         maxPayload: this.maxFedMessageSize,
-        perMessageDeflate: false // ✅ SECURITY FIX
+        perMessageDeflate: false //  SECURITY FIX
       });
 
       if (opts.probe) {
@@ -371,7 +377,7 @@ class Federation {
     
     switch (msg.type) {
       case 'fed:hello': {
-        // ✅ SECURITY FIX: HMAC challenge-response вместо raw secret
+        // SECURITY FIX: HMAC challenge-response вместо raw secret
         if (this.secret && !verifyAuthToken(msg.serverId, this.secret, msg.authTs, msg.authHmac)) {
           this._log('⚠️', `Federation auth FAILED from ${ip} (server: ${msg.serverId})`);
           ws.close(4003, 'Invalid auth');
@@ -498,6 +504,20 @@ class Federation {
         });
         break;
       }
+      case 'fed:stun-list': {
+        if (!ws._authenticated) return;
+        (msg.urls || []).forEach(item => {
+          if (!item.url || !item.url.startsWith('stun:')) return;
+          this.globalStunServers.set(item.url, {
+            url: item.url,
+            serverId: msg.serverId || ws._serverId,
+            serverName: msg.serverName || ws._serverName,
+            trust: ws._peerTrust || 'volunteer',
+            lastUpdate: Date.now()
+          });
+        });
+        break;
+      }
       default:
         break;
     }
@@ -579,6 +599,19 @@ class Federation {
       }
       case 'fed:heartbeat': {
         if (peer) peer.lastSeen = Date.now();
+        break;
+      }
+      case 'fed:stun-list': {
+        (msg.urls || []).forEach(item => {
+          if (!item.url || !item.url.startsWith('stun:')) return;
+          this.globalStunServers.set(item.url, {
+            url: item.url,
+            serverId: msg.serverId || peer?.serverId,
+            serverName: msg.serverName || peer?.serverName,
+            trust: peer?.trust || 'volunteer',
+            lastUpdate: Date.now()
+          });
+        });
         break;
       }
       default:
@@ -803,6 +836,54 @@ class Federation {
     const remote = this.globalChannels.get(channelId);
     return remote ? remote.homeServerUrl : null;
   }
+  
+  // ═══════════════════════════════════════════════════════════
+  // STUN FEDERATION API
+  // ═══════════════════════════════════════════════════════════
+  registerLocalStun(url, registeredBy = null) {
+    if (!url || typeof url !== 'string' || this.localStunUrls.has(url)) return;
+    this.localStunUrls.add(url);
+    this._log('🧊', `Local STUN registered: ${url}${registeredBy ? ' by ' + registeredBy : ''}`);
+    this.broadcastStunList();
+  }
+
+  getGlobalStunList() {
+    const list = [];
+    this.localStunUrls.forEach(url => {
+      list.push({
+        url,
+        serverId: this.serverId,
+        serverName: this.serverName,
+        trust: this.officialIds.has(this.serverId) ? 'official' : 'volunteer',
+        source: 'local'
+      });
+    });
+    this.globalStunServers.forEach((data, url) => {
+      if (!this.localStunUrls.has(url)) {
+        list.push({
+          url,
+          serverId: data.serverId,
+          serverName: data.serverName,
+          trust: data.trust,
+          source: 'federation'
+        });
+      }
+    });
+    return list;
+  }
+
+  broadcastStunList() {
+    this._broadcast({
+      type: 'fed:stun-list',
+      urls: Array.from(this.localStunUrls).map(url => ({
+        url,
+        serverId: this.serverId,
+        serverName: this.serverName
+      })),
+      serverId: this.serverId,
+      serverName: this.serverName
+    });
+  }
 
   getStatus() {
     const connectedPeers = [...this.peers.values()].filter(p => p.connected);
@@ -930,6 +1011,16 @@ class Federation {
         if (peer.ws) {
           try { peer.ws.close(); } catch(e) {}
         }
+		
+        // Cleanup dead STUN servers (no update from home server for 5 min)
+        const stunTimeout = 5 * 60 * 1000;
+        for (const [stunUrl, data] of this.globalStunServers) {
+          if (now - data.lastUpdate > stunTimeout) {
+            this.globalStunServers.delete(stunUrl);
+            this._log('🗑️', `Dead STUN removed: ${stunUrl}`);
+          }
+        }
+		
         this.peers.delete(url);
         this._log('🗑️', `Dead peer removed: ${url}`);
         if (this.io) {
