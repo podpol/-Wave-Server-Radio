@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const Federation = require('./federation');
+const { spawn } = require('child_process');
 let helmet = null;
 try { helmet = require('helmet'); } catch (e) { /* npm install helmet — рекомендуется для прод */ }
 
@@ -44,14 +45,14 @@ function saveChannels() {
           chestLocked: ch.chestLocked || false,
           totalLikes: ch.totalLikes || 0,
           created: ch.created,
-          // ✅ ПАТЧ 3: messages НЕ СОХРАНЯЕМ — они эфемерны
+          //  ПАТЧ 3: messages НЕ СОХРАНЯЕМ — они эфемерны
           approvedUsers: [...(ch.approvedUsers || [])],
           persistentSpeakers: [...(ch.persistentSpeakers || [])],
           chest: (ch.chest || []).map(file => ({ ...file }))
         });
     });
     fs.writeFileSync(SAVE_FILE, JSON.stringify(data, null, 2), 'utf8');
-    // ✅ Сохраняем глобальные имена для федерации при перезапуске
+    //  Сохраняем глобальные имена для федерации при перезапуске
     if (federation && federation.globalNames) {
         const namesData = {};
         federation.globalNames.forEach((id, name) => { namesData[name] = id; });
@@ -89,7 +90,7 @@ function loadChannels() {
     });
     console.log(`✅ Loaded ${data.length} channel(s) from backup`);
     
-    // ✅ Восстанавливаем глобальные имена федерации
+    //  Восстанавливаем глобальные имена федерации
     const namesFile = path.join(__dirname, 'federation-names-backup.json');
     if (fs.existsSync(namesFile) && federation) {
         const namesData = JSON.parse(fs.readFileSync(namesFile, 'utf8'));
@@ -115,6 +116,12 @@ function gracefulShutdown(signal) {
   if (federation) federation.shutdown();
   try { io.close(); } catch(e) {}
   try { server.close(); } catch(e) {}
+  
+  // kill STUN child
+  if (stunProcess && !stunProcess.killed) {
+    try { stunProcess.kill(); } catch(e) {}
+  }
+  
   setTimeout(() => { console.log('👋 Stopped.'); process.exit(0); }, 1000);
 }
 
@@ -136,7 +143,7 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      const allowed = ['chrome-extension://', 'http://localhost', 'http://127.0.0.1'];
+      const allowed = ['chrome-extension://', 'http://localhost', 'http://127.0.0.1', 'http://wavechat.local', 'null'];
       const extra = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
       if (!origin || allowed.some(a => String(origin).startsWith(a)) || extra.includes(origin)) {
         return callback(null, true);
@@ -263,7 +270,7 @@ function safeHandler(name, fn) {
   };
 }
 
-// ✅ ПАТЧ 1: Проверка канала перед ретрансляцией WebRTC
+//  ПАТЧ 1: Проверка канала перед ретрансляцией WebRTC
 function canSignal(socketId, targetUserId) {
   const sender = users.get(socketId);
   const target = findUser(targetUserId);
@@ -434,7 +441,7 @@ io.on('connection', (socket) => {
   socket._userId = null;
   log('🔌', `Connected: ${socket.id}`);
 
-  // ✅ ПАТЧ 7: Привязка persistentId к публичному ключу
+  // ПАТЧ 7: Привязка persistentId к публичному ключу
   socket.on('register-persistent', safeHandler('register-persistent', async (rawData, cb) => {
     const data = safeData(rawData);
     const persistentId = sanitize(data.persistentId, 40);
@@ -494,7 +501,7 @@ io.on('connection', (socket) => {
     if (userCount >= CONFIG.limits.MAX_CHANNELS_PER_USER) return callback({ error: `Limit: ${CONFIG.limits.MAX_CHANNELS_PER_USER} per user` });
     if (!channelName) return callback({ error: 'Name required' });
 
-    // ✅ ПАТЧ 12: Глобальная проверка уникальности имени + локальная
+    // ПАТЧ 12: Глобальная проверка уникальности имени + локальная
     const nameLower = channelName.toLowerCase().trim();
     if (federation.globalNames.has(nameLower)) {
       return callback({ error: `Channel name "${channelName}" is already taken globally` });
@@ -515,8 +522,8 @@ io.on('connection', (socket) => {
       joinRequests: new Map(), raisedHands: new Set(),
       recentlyApproved: new Map(), userLikes: new Map(), totalLikes: 0,
       created: Date.now(), chest: [], deleteTimer: null,
-      approvedUsers: new Set(),          // ✅ ДОБАВЛЕНО: защита от краша при request-join
-      persistentSpeakers: new Set(),     // ✅ ДОБАВЛЕНО: защита от краша при make-speaker/kick
+      approvedUsers: new Set(),          // защита от краша при request-join
+      persistentSpeakers: new Set(),     // защита от краша при make-speaker/kick
       aesKey: crypto.randomBytes(32)
     };
     channels.set(channelId, channel);
@@ -533,7 +540,7 @@ io.on('connection', (socket) => {
     saveChannels();
   }));
 
-  // ✅ ПАТЧ 2: join-channel теперь async для крипто-операций
+  // ПАТЧ 2: join-channel теперь async для крипто-операций
   socket.on('join-channel', safeHandler('join-channel', async (rawData, cb) => {
     const callback = typeof cb === 'function' ? cb : () => {};
     const now = Date.now();
@@ -601,7 +608,7 @@ io.on('connection', (socket) => {
       userId: uid, userName: req.userName, timestamp: req.timestamp
     })) : [];
 
-    // ✅ ПАТЧ 2: Шифрование и отправка AES-ключа канала новому участнику
+    // ПАТЧ 2: Шифрование и отправка AES-ключа канала новому участнику
     if (data.publicKeyJWK && channel.aesKey) {
       try {
         const { webcrypto } = require('crypto');
@@ -682,7 +689,7 @@ io.on('connection', (socket) => {
     const metadata = data.metadata;
     if (!metadata?.id || !metadata?.name) return callback({ error: 'Invalid metadata' });
     
-    // ✅ ПАТЧ 6: Строгая проверка размера файла (защита от null/undefined/string bypass)
+    // ПАТЧ 6: Строгая проверка размера файла (защита от null/undefined/string bypass)
     const fileSize = Number(metadata.size);
     if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > 500 * 1024 * 1024) {
       return callback({ error: 'Invalid or too large file size' });
@@ -828,10 +835,10 @@ io.on('connection', (socket) => {
     const userData = users.get(socket.id);
     if (!userData || !checkMessageRate(userData.userId)) return;
     
-    const channel = channels.get(userData.channelId); // ✅ Сначала получаем канал
+    const channel = channels.get(userData.channelId); //Сначала получаем канал
     if (!channel) return;
     
-    if (!channel.messages) channel.messages = []; // ✅ Теперь channel определён, это безопасно
+    if (!channel.messages) channel.messages = []; // Теперь channel определён, это безопасно
     
     const text = sanitize(data.text, CONFIG.limits.MAX_MESSAGE_LENGTH);
     if (!text && !data.encrypted && !data.meta) return;
@@ -957,7 +964,7 @@ io.on('connection', (socket) => {
     cb({ success: true });
   }));
 
-  // ✅ ПАТЧ 5: Проверка роли перед рассылкой speaking-status
+  //  ПАТЧ 5: Проверка роли перед рассылкой speaking-status
   socket.on('speaking-status', safeHandler('speaking-status', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
@@ -1056,7 +1063,7 @@ io.on('connection', (socket) => {
     if (!channel) return cb({ error: 'Not found' });
     if (data.targetUserId === channel.admin) return cb({ error: 'Cannot vote admin' });
     const voteId = uuidv4().slice(0, 8);
-    // ✅ ПАТЧ 11: votedUsers вместо votedIps (защита от NAT-блокировок)
+    // ПАТЧ 11: votedUsers вместо votedIps (защита от NAT-блокировок)
     votes.set(voteId, { 
       id: voteId, channelId: userData.channelId, targetUserId: data.targetUserId, 
       targetName: sanitize(data.targetName, 20), yes: new Set([userData.userId]), no: new Set(), 
@@ -1073,7 +1080,7 @@ io.on('connection', (socket) => {
     const vote = votes.get(data.voteId);
     if (!vote) return;
     const userData = users.get(socket.id);
-    // ✅ ПАТЧ 11: Проверка по userId, а не по IP
+    // ПАТЧ 11: Проверка по userId, а не по IP
     if (!userData || vote.votedUsers.has(userData.userId)) return;
     vote.votedUsers.add(userData.userId);
     if (data.vote === 'yes') { vote.yes.add(userData.userId); vote.no.delete(userData.userId); }
@@ -1103,7 +1110,7 @@ io.on('connection', (socket) => {
     } catch (err) { console.error('❌ finishVote:', err); }
   }
 
-  // ✅ ПАТЧ 1: WebRTC Signaling с проверкой канала
+  // ПАТЧ 1: WebRTC Signaling с проверкой канала
   socket.on('webrtc-offer', safeHandler('webrtc-offer', (d) => { 
     if (!canSignal(socket.id, d.toUserId)) return;
     const t = findUser(d.toUserId); 
@@ -1182,13 +1189,45 @@ io.on('connection', (socket) => {
 
   socket.on('get-turn-credentials', safeHandler('get-turn-credentials', (cb) => {
     if (typeof cb !== 'function') return;
+    
+    const iceServers = [
+      //Локальный STUN (запущен рядом с Lighthouse)
+      { urls: 'stun:89.248.193.233:3478' },
+      { urls: 'stun:127.0.0.1:3478' }
+    ];
+    
     const turnSecret = process.env.TURN_SECRET;
     const turnUrls = (process.env.TURN_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-    if (!turnSecret || !turnUrls.length) return cb({ iceServers: [] });
+    if (!turnSecret || !turnUrls.length) return cb({ iceServers });
+    
     const ttl = 3600;
     const username = `${Math.floor(Date.now() / 1000) + ttl}:wave`;
     const credential = crypto.createHmac('sha1', turnSecret).update(username).digest('base64');
-    cb({ iceServers: [{ urls: turnUrls, username, credential }] });
+    iceServers.unshift({ urls: turnUrls, username, credential });
+    
+    cb({ iceServers });
+  }));
+  
+  // ═══════════════════════════════════════════════════════════
+  // STUN FEDERATION (client API)
+  // ═══════════════════════════════════════════════════════════
+  socket.on('register-stun', safeHandler('register-stun', (rawData, cb) => {
+    const callback = typeof cb === 'function' ? cb : () => {};
+    const data = safeData(rawData);
+    const url = sanitize(data.url, 100);
+    if (!url || !url.startsWith('stun:')) return callback({ error: 'Invalid STUN URL. Format: stun://host:port' });
+    const match = url.match(/^stun:\/\/([^:]+):(\d+)$/);
+    if (!match) return callback({ error: 'Invalid format. Use stun://host:port' });
+    const port = parseInt(match[2]);
+    if (port < 1 || port > 65535) return callback({ error: 'Invalid port' });
+    
+    federation.registerLocalStun(url, socket._userId);
+    callback({ success: true });
+  }));
+
+  socket.on('get-stun-servers', safeHandler('get-stun-servers', (cb) => {
+    if (typeof cb !== 'function') return;
+    cb({ success: true, servers: federation.getGlobalStunList() });
   }));
 
   socket.on('bot-auth', safeHandler('bot-auth', (rawData, cb) => {
@@ -1276,6 +1315,17 @@ io.on('connection', (socket) => {
 }); 
 
 // ═══════════════════════════════════════════════════════════
+// START STUN SERVER (separate process)
+// ═══════════════════════════════════════════════════════════
+const stunProcess = spawn(process.execPath, [path.join(__dirname, 'stun-server.js')], {
+  stdio: 'inherit',
+  detached: false
+});
+stunProcess.on('error', (err) => {
+  console.error('❌ Failed to start STUN server:', err.message);
+});
+
+// ═══════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════
 
@@ -1299,6 +1349,25 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   console.log('');
   
   federation.init(io, channels, server);
+  
+  // ═══════════════════════════════════════════════════════════
+  // AUTO-REGISTER BUILT-IN STUN SERVER
+  // ═══════════════════════════════════════════════════════════
+  const os = require('os');
+  function getLocalIp() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]) {
+        if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+      }
+    }
+    return '127.0.0.1';
+  }
+  const localIp = getLocalIp();
+  federation.registerLocalStun(`stun://${localIp}:3478`, 'system');
+  if (process.env.PUBLIC_IP) {
+    federation.registerLocalStun(`stun://${process.env.PUBLIC_IP}:3478`, 'system');
+  }
   
   console.log('  🛡️  Crash protection: ENABLED');
   console.log('  💾 Auto-save: Every 60s');
