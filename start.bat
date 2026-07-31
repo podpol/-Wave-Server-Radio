@@ -63,6 +63,7 @@ for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /C:"IPv4"') do (
     for /f "tokens=1" %%b in ("%%a") do (
         echo     🏠 ws://%%b:3000        (клиенты)
         echo     🕸️  ws://%%b:3001        (федерация — для других серверов сети)
+		echo     🧊 stun://%%b:3478       (STUN — NAT traversal для WebRTC)
     )
 )
 echo.
