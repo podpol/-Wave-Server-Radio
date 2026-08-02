@@ -59,7 +59,7 @@ function writeXorMappedAddress(rinfo) {
   attr.writeUInt8(0x01, 5); // IPv4
   attr.writeUInt16BE(port ^ (MAGIC_COOKIE >> 16), 6);
   attr.writeUInt32BE(
-    ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) ^ MAGIC_COOKIE,
+    (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) ^ MAGIC_COOKIE) >>> 0,
     8
   );
   return attr;
