@@ -27,7 +27,7 @@ const crypto = require('crypto');
 const Federation = require('./federation');
 const { spawn } = require('child_process');
 let helmet = null;
-try { helmet = require('helmet'); } catch (e) { /* npm install helmet — рекомендуется для прод */ }
+try { helmet = require('helmet'); } catch (e) { /* npm install helmet */ }
 
 const SAVE_FILE = path.join(__dirname, 'channels-backup.json');
 
@@ -45,14 +45,12 @@ function saveChannels() {
           chestLocked: ch.chestLocked || false,
           totalLikes: ch.totalLikes || 0,
           created: ch.created,
-          //  ПАТЧ 3: messages НЕ СОХРАНЯЕМ — они эфемерны
           approvedUsers: [...(ch.approvedUsers || [])],
           persistentSpeakers: [...(ch.persistentSpeakers || [])],
           chest: (ch.chest || []).map(file => ({ ...file }))
         });
     });
     fs.writeFileSync(SAVE_FILE, JSON.stringify(data, null, 2), 'utf8');
-    //  Сохраняем глобальные имена для федерации при перезапуске
     if (federation && federation.globalNames) {
         const namesData = {};
         federation.globalNames.forEach((id, name) => { namesData[name] = id; });
@@ -60,7 +58,6 @@ function saveChannels() {
     }
   } catch (err) {
     console.error('❌ Failed to save channels:', err.message);
-    // Fallback save without federation names if it fails
     try {
         const data = [];
         channels.forEach((ch, id) => {
@@ -81,16 +78,16 @@ function loadChannels() {
           speakers: new Map(), listeners: new Map(),
           joinRequests: new Map(), raisedHands: new Set(),
           recentlyApproved: new Map(), userLikes: new Map(),
-          messages: [],  // ← фикс
+          messages: [],
           chest: ch.chest || [], deleteTimer: null,
           approvedUsers: new Set(ch.approvedUsers || []),
           persistentSpeakers: new Set(ch.persistentSpeakers || []),
-          aesKey: crypto.randomBytes(32) 
+          aesKey: crypto.randomBytes(32)
         });
+        scheduleChannelDeletion(ch.id);
     });
     console.log(`✅ Loaded ${data.length} channel(s) from backup`);
-    
-    //  Восстанавливаем глобальные имена федерации
+
     const namesFile = path.join(__dirname, 'federation-names-backup.json');
     if (fs.existsSync(namesFile) && federation) {
         const namesData = JSON.parse(fs.readFileSync(namesFile, 'utf8'));
@@ -116,12 +113,9 @@ function gracefulShutdown(signal) {
   if (federation) federation.shutdown();
   try { io.close(); } catch(e) {}
   try { server.close(); } catch(e) {}
-  
-  // kill STUN child
   if (stunProcess && !stunProcess.killed) {
     try { stunProcess.kill(); } catch(e) {}
   }
-  
   setTimeout(() => { console.log('👋 Stopped.'); process.exit(0); }, 1000);
 }
 
@@ -168,7 +162,7 @@ const CONFIG = {
     MAX_CHANNELS: 1000, MAX_CHANNELS_PER_USER: 1,
     MAX_SPEAKERS: 10, MAX_LISTENERS: 30, MAX_USERS: 40,
     BAN_DURATION: 30 * 60 * 1000, VOTE_DURATION: 60 * 1000,
-    VOTE_THRESHOLD: 0.5, MAX_MESSAGE_LENGTH: 500,
+    VOTE_THRESHOLD: 0.5, MAX_MESSAGE_LENGTH: 200000,
     MAX_NAME_LENGTH: 20, MAX_CHANNEL_NAME_LENGTH: 30,
     MESSAGE_HISTORY: 200, REQUEST_EXPIRY: 5 * 60 * 1000,
     MAX_PAYLOAD_SIZE: 200_000_000
@@ -270,7 +264,6 @@ function safeHandler(name, fn) {
   };
 }
 
-//  ПАТЧ 1: Проверка канала перед ретрансляцией WebRTC
 function canSignal(socketId, targetUserId) {
   const sender = users.get(socketId);
   const target = findUser(targetUserId);
@@ -424,13 +417,19 @@ function scheduleChannelDeletion(channelId) {
       io.emit('federation-channels-updated', federation.getGlobalChannelList());
       log('🗑️', `"${ch.name}" auto-deleted (24h inactive)`);
     }
-  }, 24 * 60 * 60 * 1000);
+  }, 22 * 60 * 60 * 1000);
 }
 
 function cancelChannelDeletion(channelId) {
   const channel = channels.get(channelId);
   if (channel && channel.deleteTimer) { clearTimeout(channel.deleteTimer); channel.deleteTimer = null; }
 }
+
+// ═══════════════════════════════════════════════════════════
+// PRIVATE CALLS — shared state (module-level)
+// ═══════════════════════════════════════════════════════════
+
+const activeCalls = new Map();
 
 // ═══════════════════════════════════════════════════════════
 // SOCKET.IO — MAIN HANDLER
@@ -441,7 +440,6 @@ io.on('connection', (socket) => {
   socket._userId = null;
   log('🔌', `Connected: ${socket.id}`);
 
-  // ПАТЧ 7: Привязка persistentId к публичному ключу
   socket.on('register-persistent', safeHandler('register-persistent', async (rawData, cb) => {
     const data = safeData(rawData);
     const persistentId = sanitize(data.persistentId, 40);
@@ -452,18 +450,16 @@ io.on('connection', (socket) => {
     const existing = [...users.entries()].find(([,u]) => u.userId === persistentId);
     if (existing) {
       const [existingSocketId, existingUser] = existing;
-      // Если ключ не совпадает — это попытка кражи личности
       if (existingUser.publicKeyJWK && existingUser.publicKeyJWK !== publicKeyJWK) {
         return cb({ error: 'Identity mismatch' });
       }
-      // Иначе отключаем старое соединение
       const old = io.sockets.sockets.get(existingSocketId);
       if (old) { try { old.disconnect(true); } catch(e) {} }
     }
     
     socket._userId = persistentId;
     socket._registered = true;
-    socket._publicKeyJWK = publicKeyJWK; // Сохраняем ключ для будущих проверок
+    socket._publicKeyJWK = publicKeyJWK;
     cb({ success: true, userId: persistentId });
   }));
 
@@ -501,7 +497,6 @@ io.on('connection', (socket) => {
     if (userCount >= CONFIG.limits.MAX_CHANNELS_PER_USER) return callback({ error: `Limit: ${CONFIG.limits.MAX_CHANNELS_PER_USER} per user` });
     if (!channelName) return callback({ error: 'Name required' });
 
-    // ПАТЧ 12: Глобальная проверка уникальности имени + локальная
     const nameLower = channelName.toLowerCase().trim();
     if (federation.globalNames.has(nameLower)) {
       return callback({ error: `Channel name "${channelName}" is already taken globally` });
@@ -522,8 +517,8 @@ io.on('connection', (socket) => {
       joinRequests: new Map(), raisedHands: new Set(),
       recentlyApproved: new Map(), userLikes: new Map(), totalLikes: 0,
       created: Date.now(), chest: [], deleteTimer: null,
-      approvedUsers: new Set(),          // защита от краша при request-join
-      persistentSpeakers: new Set(),     // защита от краша при make-speaker/kick
+      approvedUsers: new Set(),
+      persistentSpeakers: new Set(),
       aesKey: crypto.randomBytes(32)
     };
     channels.set(channelId, channel);
@@ -540,7 +535,6 @@ io.on('connection', (socket) => {
     saveChannels();
   }));
 
-  // ПАТЧ 2: join-channel теперь async для крипто-операций
   socket.on('join-channel', safeHandler('join-channel', async (rawData, cb) => {
     const callback = typeof cb === 'function' ? cb : () => {};
     const now = Date.now();
@@ -608,7 +602,6 @@ io.on('connection', (socket) => {
       userId: uid, userName: req.userName, timestamp: req.timestamp
     })) : [];
 
-    // ПАТЧ 2: Шифрование и отправка AES-ключа канала новому участнику
     if (data.publicKeyJWK && channel.aesKey) {
       try {
         const { webcrypto } = require('crypto');
@@ -665,7 +658,7 @@ io.on('connection', (socket) => {
     const channel = channels.get(channelId);
     if (!channel) return cb({ error: 'Channel not found' });
     if (channel.admin === userId || channel.speakers.has(userId) || channel.listeners.has(userId)) return cb({ approved: true });
-	if (channel.approvedUsers.has(userId)) return cb({ approved: true });
+    if (channel.approvedUsers.has(userId)) return cb({ approved: true });
     if (channel.recentlyApproved?.has(userId)) {
       if (Date.now() < channel.recentlyApproved.get(userId)) return cb({ approved: true });
       channel.recentlyApproved.delete(userId);
@@ -689,7 +682,6 @@ io.on('connection', (socket) => {
     const metadata = data.metadata;
     if (!metadata?.id || !metadata?.name) return callback({ error: 'Invalid metadata' });
     
-    // ПАТЧ 6: Строгая проверка размера файла (защита от null/undefined/string bypass)
     const fileSize = Number(metadata.size);
     if (!Number.isFinite(fileSize) || fileSize <= 0 || fileSize > 500 * 1024 * 1024) {
       return callback({ error: 'Invalid or too large file size' });
@@ -817,9 +809,9 @@ io.on('connection', (socket) => {
     channel.joinRequests.delete(data.targetUserId);
     if (!channel.recentlyApproved) channel.recentlyApproved = new Map();
     if (data.approved) {
-		channel.approvedUsers.add(data.targetUserId);
-        channel.recentlyApproved.set(data.targetUserId, Date.now() + 10000);
-	}
+      channel.approvedUsers.add(data.targetUserId);
+      channel.recentlyApproved.set(data.targetUserId, Date.now() + 10000);
+    }
     let delivered = false;
     if (request.socketId) {
       const ts = io.sockets.sockets.get(request.socketId);
@@ -835,18 +827,29 @@ io.on('connection', (socket) => {
     const userData = users.get(socket.id);
     if (!userData || !checkMessageRate(userData.userId)) return;
     
-    const channel = channels.get(userData.channelId); //Сначала получаем канал
+    const channel = channels.get(userData.channelId);
     if (!channel) return;
     
-    if (!channel.messages) channel.messages = []; // Теперь channel определён, это безопасно
+    if (!channel.messages) channel.messages = [];
     
     const text = sanitize(data.text, CONFIG.limits.MAX_MESSAGE_LENGTH);
     if (!text && !data.encrypted && !data.meta) return;
     
-    const msg = { id: uuidv4().slice(0, 10), userId: userData.userId, userName: userData.userName, text: text || '', timestamp: Date.now() };
+    const msg = {
+      id: uuidv4().slice(0, 10),
+      userId: userData.userId,
+      userName: userData.userName,
+      text: text || '',
+      timestamp: Date.now()
+    };
     if (data.encrypted) msg.encrypted = data.encrypted;
     if (data.replyTo && typeof data.replyTo === 'object') {
-      msg.replyTo = { id: sanitize(data.replyTo.id, 20), userId: sanitize(data.replyTo.userId, 40), userName: sanitize(data.replyTo.userName, 20), text: sanitize(data.replyTo.text, 200) };
+      msg.replyTo = {
+        id: sanitize(data.replyTo.id, 20),
+        userId: sanitize(data.replyTo.userId, 40),
+        userName: sanitize(data.replyTo.userName, 20),
+        text: sanitize(data.replyTo.text, 200)
+      };
     }
     if (data.meta) msg.meta = data.meta;
     
@@ -884,7 +887,7 @@ io.on('connection', (socket) => {
     if (!listener) return cb({ error: 'Not found' });
     channel.listeners.delete(data.targetUserId);
     channel.speakers.set(data.targetUserId, { userId: data.targetUserId, name: listener.name, socketId: listener.socketId });
-	channel.persistentSpeakers.add(data.targetUserId);
+    channel.persistentSpeakers.add(data.targetUserId);
     channel.raisedHands.delete(data.targetUserId);
     const target = findUser(data.targetUserId);
     if (target) users.get(target.socketId).role = 'speaker';
@@ -903,7 +906,7 @@ io.on('connection', (socket) => {
     if (data.targetUserId === channel.admin) return cb({ error: 'Cannot demote admin' });
     channel.speakers.delete(data.targetUserId);
     channel.listeners.set(data.targetUserId, { name: speaker.name, socketId: speaker.socketId });
-	channel.persistentSpeakers.delete(data.targetUserId);
+    channel.persistentSpeakers.delete(data.targetUserId);
     const target = findUser(data.targetUserId);
     if (target) users.get(target.socketId).role = 'listener';
     io.to(userData.channelId).emit('role-changed', { userId: data.targetUserId, role: 'listener', userName: speaker.name });
@@ -919,7 +922,7 @@ io.on('connection', (socket) => {
     if (target) { try { io.to(target.socketId).emit('kicked', { reason: sanitize(data.reason, 100) || 'Kicked' }); } catch(e) {} try { io.sockets.sockets.get(target.socketId)?.disconnect(); } catch(e) {} }
     const name = channel.speakers.get(data.targetUserId)?.name || channel.listeners.get(data.targetUserId)?.name || 'User';
     channel.speakers.delete(data.targetUserId); channel.listeners.delete(data.targetUserId); channel.raisedHands.delete(data.targetUserId);
-	channel.approvedUsers.delete(data.targetUserId);
+    channel.approvedUsers.delete(data.targetUserId);
     channel.persistentSpeakers.delete(data.targetUserId);
     io.to(userData.channelId).emit('user-left', { userId: data.targetUserId, userName: name });
     cb({ success: true });
@@ -964,12 +967,11 @@ io.on('connection', (socket) => {
     cb({ success: true });
   }));
 
-  //  ПАТЧ 5: Проверка роли перед рассылкой speaking-status
   socket.on('speaking-status', safeHandler('speaking-status', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
     if (!userData) return;
-    if (userData.role !== 'speaker' && userData.role !== 'admin') return; // ← защита от listener spam
+    if (userData.role !== 'speaker' && userData.role !== 'admin') return;
     
     const chId = userData.channelId;
     if (!channelSpeaking.has(chId)) channelSpeaking.set(chId, new Set());
@@ -1063,7 +1065,6 @@ io.on('connection', (socket) => {
     if (!channel) return cb({ error: 'Not found' });
     if (data.targetUserId === channel.admin) return cb({ error: 'Cannot vote admin' });
     const voteId = uuidv4().slice(0, 8);
-    // ПАТЧ 11: votedUsers вместо votedIps (защита от NAT-блокировок)
     votes.set(voteId, { 
       id: voteId, channelId: userData.channelId, targetUserId: data.targetUserId, 
       targetName: sanitize(data.targetName, 20), yes: new Set([userData.userId]), no: new Set(), 
@@ -1080,7 +1081,6 @@ io.on('connection', (socket) => {
     const vote = votes.get(data.voteId);
     if (!vote) return;
     const userData = users.get(socket.id);
-    // ПАТЧ 11: Проверка по userId, а не по IP
     if (!userData || vote.votedUsers.has(userData.userId)) return;
     vote.votedUsers.add(userData.userId);
     if (data.vote === 'yes') { vote.yes.add(userData.userId); vote.no.delete(userData.userId); }
@@ -1101,7 +1101,7 @@ io.on('connection', (socket) => {
         if (target) { try { io.to(target.socketId).emit('kicked', { reason: 'Vote' }); } catch(e) {} try { io.sockets.sockets.get(target.socketId)?.disconnect(); } catch(e) {} }
         channel.speakers.delete(vote.targetUserId); channel.listeners.delete(vote.targetUserId);
         io.to(vote.channelId).emit('vote-result', { voteId, kicked: true, targetName: vote.targetName });
-		channel.approvedUsers.delete(vote.targetUserId);
+        channel.approvedUsers.delete(vote.targetUserId);
         channel.persistentSpeakers.delete(vote.targetUserId);
       } else {
         io.to(vote.channelId).emit('vote-result', { voteId, kicked: false, targetName: vote.targetName });
@@ -1110,7 +1110,6 @@ io.on('connection', (socket) => {
     } catch (err) { console.error('❌ finishVote:', err); }
   }
 
-  // ПАТЧ 1: WebRTC Signaling с проверкой канала
   socket.on('webrtc-offer', safeHandler('webrtc-offer', (d) => { 
     if (!canSignal(socket.id, d.toUserId)) return;
     const t = findUser(d.toUserId); 
@@ -1127,6 +1126,12 @@ io.on('connection', (socket) => {
     if (!canSignal(socket.id, d.toUserId)) return;
     const t = findUser(d.toUserId); 
     if (t) io.to(t.socketId).emit('webrtc-ice', d); 
+  }));
+
+  socket.on('media-failed', safeHandler('media-failed', (d) => {
+    if (!canSignal(socket.id, d.toUserId)) return;
+    const t = findUser(d.toUserId);
+    if (t) io.to(t.socketId).emit('media-failed', d);
   }));
 
   socket.on('toggle-channel-approval', safeHandler('toggle-channel-approval', (rawData, cb) => {
@@ -1191,7 +1196,6 @@ io.on('connection', (socket) => {
     if (typeof cb !== 'function') return;
     
     const iceServers = [
-      //Локальный STUN (запущен рядом с Lighthouse)
       { urls: 'stun:89.248.193.233:3478' },
       { urls: 'stun:127.0.0.1:3478' }
     ];
@@ -1207,20 +1211,19 @@ io.on('connection', (socket) => {
     
     cb({ iceServers });
   }));
-  
-  // ═══════════════════════════════════════════════════════════
-  // STUN FEDERATION (client API)
-  // ═══════════════════════════════════════════════════════════
+
   socket.on('register-stun', safeHandler('register-stun', (rawData, cb) => {
     const callback = typeof cb === 'function' ? cb : () => {};
     const data = safeData(rawData);
     const url = sanitize(data.url, 100);
-    if (!url || !url.startsWith('stun:')) return callback({ error: 'Invalid STUN URL. Format: stun://host:port' });
-    const match = url.match(/^stun:\/\/([^:]+):(\d+)$/);
-    if (!match) return callback({ error: 'Invalid format. Use stun://host:port' });
+    if (!url || !url.startsWith('stun:') || url.startsWith('stun://')) {
+      return callback({ error: 'Invalid STUN URL. Format: stun:host:port' });
+    }
+    const match = url.match(/^stun:([^:/]+):(\d+)$/);
+    if (!match) return callback({ error: 'Invalid format. Use stun:host:port' });
     const port = parseInt(match[2]);
     if (port < 1 || port > 65535) return callback({ error: 'Invalid port' });
-    
+  
     federation.registerLocalStun(url, socket._userId);
     callback({ success: true });
   }));
@@ -1256,6 +1259,274 @@ io.on('connection', (socket) => {
     io.to(userData.channelId).emit('new-message', msg);
   }));
 
+  socket.on('get-federation-peers', safeHandler('get-federation-peers', (cb) => {
+    if (typeof cb !== 'function') return;
+    const fedStatus = federation.getStatus();
+    const peers = [{
+      serverId: fedStatus.serverId,
+      serverName: fedStatus.serverName,
+      url: fedStatus.serverUrl,
+      isSelf: true,
+      trust: fedStatus.isOfficial ? 'official' : 'volunteer'
+    }];
+    (fedStatus.peers || []).forEach(p => {
+      peers.push({
+        serverId: p.serverId,
+        serverName: p.serverName,
+        url: p.url,
+        isSelf: false,
+        trust: p.trust || 'unknown'
+      });
+    });
+    cb({ success: true, peers, selfUrl: fedStatus.serverUrl });
+  }));
+
+  // ═══════════════════════════════════════════════════════════
+  // PRIVATE CALLS SYSTEM (до 6 человек)
+  // ✅ ВНУТРИ io.on('connection') — socket доступен
+  // ═══════════════════════════════════════════════════════════
+
+  socket.on('call-create', safeHandler('call-create', (rawData, cb) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return cb({ error: 'Not connected' });
+    
+    const callId = 'call_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
+    const participants = new Map();
+    participants.set(userData.userId, { socketId: socket.id, userName: userData.userName });
+    
+    const invitees = (data.invitees || []).slice(0, 5);
+    for (const inviteeId of invitees) {
+      const invitee = findUser(inviteeId);
+      if (invitee && invitee.socketId !== socket.id) {
+        participants.set(inviteeId, { socketId: invitee.socketId, userName: invitee.userName });
+      }
+    }
+    
+    activeCalls.set(callId, { participants, initiator: userData.userId, startedAt: Date.now() });
+    
+    participants.forEach((p, uid) => {
+      if (uid !== userData.userId) {
+        io.to(p.socketId).emit('call-invited', {
+          callId,
+          initiatorId: userData.userId,
+          initiatorName: userData.userName,
+          participants: Array.from(participants.entries()).map(([uid2, p2]) => ({ userId: uid2, userName: p2.userName }))
+        });
+      }
+    });
+    
+    cb({ success: true, callId });
+    log('📞', `Call created: ${callId} by ${userData.userName} (${participants.size} participants)`);
+  }));
+
+  socket.on('call-accept', safeHandler('call-accept', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    
+    const call = activeCalls.get(data.callId);
+    if (!call) return;
+    
+    const participant = call.participants.get(userData.userId);
+    if (participant) participant.socketId = socket.id;
+    
+    call.participants.forEach((p, uid) => {
+      if (uid !== userData.userId) {
+        io.to(p.socketId).emit('call-joined', { callId: data.callId, userId: userData.userId, userName: userData.userName });
+      }
+    });
+    
+    log('✅', `${userData.userName} joined call ${data.callId}`);
+  }));
+
+  socket.on('call-decline', safeHandler('call-decline', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    
+    const call = activeCalls.get(data.callId);
+    if (!call) return;
+    
+    call.participants.forEach((p) => {
+      io.to(p.socketId).emit('call-declined', { callId: data.callId, userId: userData.userId, userName: userData.userName });
+    });
+    
+    log('❌', `${userData.userName} declined call ${data.callId}`);
+  }));
+
+  socket.on('call-leave', safeHandler('call-leave', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    
+    const call = activeCalls.get(data.callId);
+    if (!call) return;
+    
+    call.participants.delete(userData.userId);
+    
+    if (call.participants.size < 2) {
+      call.participants.forEach((p) => {
+        io.to(p.socketId).emit('call-ended', { callId: data.callId, reason: 'left' });
+      });
+      activeCalls.delete(data.callId);
+      log('🔚', `Call ${data.callId} ended (not enough participants)`);
+    } else {
+      call.participants.forEach((p) => {
+        io.to(p.socketId).emit('call-left', { callId: data.callId, userId: userData.userId, userName: userData.userName });
+      });
+    }
+  }));
+
+  socket.on('call-invite', safeHandler('call-invite', (rawData, cb) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return cb({ error: 'Not connected' });
+    
+    const call = activeCalls.get(data.callId);
+    if (!call) return cb({ error: 'Call not found' });
+    if (!call.participants.has(userData.userId)) return cb({ error: 'Not in call' });
+    if (call.participants.size >= 6) return cb({ error: 'Maximum 6 participants' });
+    
+    const invitee = findUser(data.targetUserId);
+    if (!invitee) return cb({ error: 'User not found' });
+    if (call.participants.has(data.targetUserId)) return cb({ error: 'Already in call' });
+    
+    call.participants.set(data.targetUserId, { socketId: invitee.socketId, userName: invitee.userName });
+    
+    io.to(invitee.socketId).emit('call-invited', {
+      callId: data.callId,
+      initiatorId: userData.userId,
+      initiatorName: userData.userName,
+      participants: Array.from(call.participants.entries()).map(([uid, p]) => ({ userId: uid, userName: p.userName }))
+    });
+    
+    cb({ success: true });
+    log('➕', `${userData.userName} invited ${invitee.userName} to call ${data.callId}`);
+  }));
+
+  socket.on('call-transfer', safeHandler('call-transfer', (rawData, cb) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return cb({ error: 'Not connected' });
+    
+    const call = activeCalls.get(data.callId);
+    if (!call) return cb({ error: 'Call not found' });
+    if (!call.participants.has(userData.userId)) return cb({ error: 'Not in call' });
+    
+    const newParticipant = findUser(data.targetUserId);
+    if (!newParticipant) return cb({ error: 'User not found' });
+    
+    call.participants.delete(userData.userId);
+    call.participants.set(data.targetUserId, { socketId: newParticipant.socketId, userName: newParticipant.userName });
+    
+    call.participants.forEach((p) => {
+      io.to(p.socketId).emit('call-transferred', {
+        callId: data.callId, fromUserId: userData.userId, fromUserName: userData.userName,
+        toUserId: data.targetUserId, toUserName: newParticipant.userName
+      });
+    });
+    
+    io.to(newParticipant.socketId).emit('call-invited', {
+      callId: data.callId, initiatorId: userData.userId, initiatorName: userData.userName,
+      participants: Array.from(call.participants.entries()).map(([uid, p]) => ({ userId: uid, userName: p.userName })),
+      transferred: true
+    });
+    
+    cb({ success: true });
+    log('🔀', `Call ${data.callId} transferred from ${userData.userName} to ${newParticipant.userName}`);
+  }));
+
+  socket.on('call-force-end', safeHandler('call-force-end', (rawData, cb) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return cb({ error: 'Not connected' });
+    
+    const channel = channels.get(userData.channelId);
+    if (!channel || channel.admin !== userData.userId) return cb({ error: 'Admin only' });
+    
+    const call = activeCalls.get(data.callId);
+    if (!call) return cb({ error: 'Call not found' });
+    
+    call.participants.forEach((p) => {
+      io.to(p.socketId).emit('call-ended', { callId: data.callId, reason: 'admin', adminName: userData.userName });
+    });
+    
+    activeCalls.delete(data.callId);
+    cb({ success: true });
+    log('🛑', `Call ${data.callId} force-ended by admin ${userData.userName}`);
+  }));
+
+  socket.on('call-get-active', safeHandler('call-get-active', (cb) => {
+    const userData = users.get(socket.id);
+    if (!userData) return cb({ calls: [] });
+    
+    const activeCallsList = [];
+    activeCalls.forEach((call, callId) => {
+      let inSameChannel = false;
+      call.participants.forEach((p, uid) => {
+        const u = findUser(uid);
+        if (u && u.channelId === userData.channelId) inSameChannel = true;
+      });
+      if (inSameChannel) {
+        activeCallsList.push({
+          callId,
+          participants: Array.from(call.participants.entries()).map(([uid, p]) => ({ userId: uid, userName: p.userName })),
+          startedAt: call.startedAt
+        });
+      }
+    });
+    
+    cb({ calls: activeCallsList });
+  }));
+
+  socket.on('call-offer', safeHandler('call-offer', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    const target = findUser(data.toUserId);
+    if (target) {
+      io.to(target.socketId).emit('call-offer', { fromUserId: userData.userId, fromUserName: userData.userName, offer: data.offer, callId: data.callId });
+    }
+  }));
+
+  socket.on('call-answer', safeHandler('call-answer', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    const target = findUser(data.toUserId);
+    if (target) {
+      io.to(target.socketId).emit('call-answer', { fromUserId: userData.userId, answer: data.answer, callId: data.callId });
+    }
+  }));
+
+  socket.on('call-ice', safeHandler('call-ice', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    const target = findUser(data.toUserId);
+    if (target) {
+      io.to(target.socketId).emit('call-ice', { fromUserId: userData.userId, candidate: data.candidate, callId: data.callId });
+    }
+  }));
+
+  socket.on('call-quality', safeHandler('call-quality', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData) return;
+    const call = activeCalls.get(data.callId);
+    if (!call) return;
+    call.participants.forEach((p, uid) => {
+      if (uid !== userData.userId) {
+        io.to(p.socketId).emit('call-quality-update', { callId: data.callId, userId: userData.userId, quality: data.quality });
+      }
+    });
+  }));
+
+  // ═══════════════════════════════════════════════════════════
+  // DISCONNECT
+  // ═══════════════════════════════════════════════════════════
+
   socket.on('disconnect', () => {
     try {
       const ip = socket._clientIp;
@@ -1263,7 +1534,27 @@ io.on('connection', (socket) => {
       socketRates.delete(socket.id);
       joinCooldowns.delete(socket.id);
       relayHelpers.delete(socket.id);
+
+      // Cleanup from active calls
       const userData = users.get(socket.id);
+      if (userData) {
+        activeCalls.forEach((call, callId) => {
+          if (call.participants.has(userData.userId)) {
+            call.participants.delete(userData.userId);
+            if (call.participants.size < 2) {
+              call.participants.forEach((p) => {
+                io.to(p.socketId).emit('call-ended', { callId, reason: 'disconnected' });
+              });
+              activeCalls.delete(callId);
+            } else {
+              call.participants.forEach((p) => {
+                io.to(p.socketId).emit('call-left', { callId, userId: userData.userId, userName: userData.userName });
+              });
+            }
+          }
+        });
+      }
+
       if (!userData) return;
       const channel = channels.get(userData.channelId);
       if (!channel) { users.delete(socket.id); return; }
@@ -1285,34 +1576,8 @@ io.on('connection', (socket) => {
       federation.broadcastChannelUpdated(channel);
     } catch (err) { console.error('❌ disconnect:', err); }
   });
-  
-    // ═══════════════════════════════════════════════════════════
-    // FEDERATION PEERS DISCOVERY (для клиентского failover)
-    // ═══════════════════════════════════════════════════════════
-    socket.on('get-federation-peers', safeHandler('get-federation-peers', (cb) => {
-      if (typeof cb !== 'function') return;
-      const fedStatus = federation.getStatus();
-      const peers = [{
-        serverId: fedStatus.serverId,
-        serverName: fedStatus.serverName,
-        url: fedStatus.serverUrl,
-        isSelf: true,
-        trust: fedStatus.isOfficial ? 'official' : 'volunteer'
-      }];
-      // Добавляем подключённых пиров
-      (fedStatus.peers || []).forEach(p => {
-        peers.push({
-          serverId: p.serverId,
-          serverName: p.serverName,
-          url: p.url,
-          isSelf: false,
-          trust: p.trust || 'unknown'
-        });
-      });
-      cb({ success: true, peers, selfUrl: fedStatus.serverUrl });
-    }));
 
-}); 
+}); // ← конец io.on('connection')
 
 // ═══════════════════════════════════════════════════════════
 // START STUN SERVER (separate process)
@@ -1350,9 +1615,6 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   
   federation.init(io, channels, server);
   
-  // ═══════════════════════════════════════════════════════════
-  // AUTO-REGISTER BUILT-IN STUN SERVER
-  // ═══════════════════════════════════════════════════════════
   const os = require('os');
   function getLocalIp() {
     const interfaces = os.networkInterfaces();
@@ -1364,9 +1626,9 @@ server.listen(CONFIG.port, CONFIG.host, () => {
     return '127.0.0.1';
   }
   const localIp = getLocalIp();
-  federation.registerLocalStun(`stun://${localIp}:3478`, 'system');
+    federation.registerLocalStun(`stun:${localIp}:3478`, 'system');
   if (process.env.PUBLIC_IP) {
-    federation.registerLocalStun(`stun://${process.env.PUBLIC_IP}:3478`, 'system');
+    federation.registerLocalStun(`stun:${process.env.PUBLIC_IP}:3478`, 'system');
   }
   
   console.log('  🛡️  Crash protection: ENABLED');
