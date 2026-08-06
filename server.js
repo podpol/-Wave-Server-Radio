@@ -1,11 +1,11 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * Wave 🌊 — Lighthouse Server v2.0 (Federation Edition)
+ * Wave 🌊 — Lighthouse Server v2.1 (Federation Edition)
  * ═══════════════════════════════════════════════════════════
  * Stack: Node.js + Express + Socket.io + Federation
  * License: AGPL-3.0
  * 
- * NEW in v2.0:
+ * NEW in v2.1:
  *  - Federation: multiple servers form a global network
  *  - Channels visible across all federated servers
  *  - Globally unique channel names
@@ -42,6 +42,7 @@ function saveChannels() {
         data.push({
           id: ch.id, name: ch.name, admin: ch.admin, adminName: ch.adminName,
           requireApproval: ch.requireApproval,
+		  hidden: ch.hidden || false,
           chestLocked: ch.chestLocked || false,
           totalLikes: ch.totalLikes || 0,
           created: ch.created,
@@ -61,7 +62,7 @@ function saveChannels() {
     try {
         const data = [];
         channels.forEach((ch, id) => {
-            data.push({ id: ch.id, name: ch.name, admin: ch.admin, adminName: ch.adminName, requireApproval: ch.requireApproval, chestLocked: ch.chestLocked || false, totalLikes: ch.totalLikes || 0, created: ch.created, approvedUsers: [...(ch.approvedUsers || [])], persistentSpeakers: [...(ch.persistentSpeakers || [])], chest: (ch.chest || []).map(file => ({ ...file })) });
+            data.push({ id: ch.id, name: ch.name, admin: ch.admin, adminName: ch.adminName, requireApproval: ch.requireApproval, hidden: ch.hidden || false, chestLocked: ch.chestLocked || false, totalLikes: ch.totalLikes || 0, created: ch.created, approvedUsers: [...(ch.approvedUsers || [])], persistentSpeakers: [...(ch.persistentSpeakers || [])], chest: (ch.chest || []).map(file => ({ ...file })) });
         });
         fs.writeFileSync(SAVE_FILE, JSON.stringify(data, null, 2), 'utf8');
     } catch(e) {}
@@ -82,6 +83,7 @@ function loadChannels() {
           chest: ch.chest || [], deleteTimer: null,
           approvedUsers: new Set(ch.approvedUsers || []),
           persistentSpeakers: new Set(ch.persistentSpeakers || []),
+          relayTrees: new Map(), // broadcasterId -> RelayTree (не персистится, строится заново)
           aesKey: crypto.randomBytes(32)
         });
         scheduleChannelDeletion(ch.id);
@@ -165,7 +167,7 @@ const CONFIG = {
     VOTE_THRESHOLD: 0.5, MAX_MESSAGE_LENGTH: 200000,
     MAX_NAME_LENGTH: 20, MAX_CHANNEL_NAME_LENGTH: 30,
     MESSAGE_HISTORY: 200, REQUEST_EXPIRY: 5 * 60 * 1000,
-    MAX_PAYLOAD_SIZE: 200_000_000
+    MAX_PAYLOAD_SIZE: 200_000_000, MAX_RELAY_FANOUT: 5
   },
   security: {
     MAX_CONNECTIONS_PER_IP: 10, MAX_EVENTS_PER_SECOND: 30,
@@ -189,6 +191,16 @@ if (!CONFIG.apiKey && process.env.NODE_ENV === 'production') {
 
 const channels = new Map();
 const users = new Map();
+// persistentId -> socketId. Отдельно от `users`, потому что `users` заполняется
+// только при join-channel — то есть человек, который просто открыл приложение
+// и сидит на главном экране (ещё не зашёл ни в один канал), туда не попадает,
+// и findUser() его не находит. Из-за этого личные сообщения ему молча терялись.
+const onlineUsers = new Map();
+// persistentId -> [{fromUserId, fromUserName, text, media, msgId, timestamp}]
+// Очередь недоставленных ЛС на случай, если получатель не в сети в момент
+// отправки — раньше в этом случае сообщение просто пропадало без следа.
+const pendingDMs = new Map();
+const MAX_PENDING_DMS_PER_USER = 200;
 const bans = new Map();
 const votes = new Map();
 const ipConnections = new Map();
@@ -199,6 +211,20 @@ const channelScreenShare = new Map();
 const channelLikes = new Map();
 const joinCooldowns = new Map();
 const relayHelpers = new Map();
+
+// ═══ SHARED FOLDERS + SEED REPUTATION ═══
+const userShares = new Map();      // userId -> { files, visibility, targets, folderName, updated }
+const userSeedStats = new Map();   // userId -> { bytesGiven, filesGiven, achievements }
+function getSeedAchievements(bytes, files) {
+  const a = [];
+  if (files >= 1)    a.push('🌱');
+  if (files >= 10)   a.push('🌿');
+  if (files >= 50)   a.push('🌳');
+  if (files >= 100)  a.push('🌲');
+  if (bytes >= 1024*1024*100)  a.push('💾');
+  if (bytes >= 1024*1024*1024) a.push('💎');
+  return a;
+}
 
 // ═══════════════════════════════════════════════════════════
 // FEDERATION INIT
@@ -214,6 +240,184 @@ const federation = new Federation({
   officialIds: process.env.OFFICIAL_SERVER_IDS || '',
   maxPeers: process.env.FEDERATION_MAX_PEERS || 40
 });
+
+// ═══════════════════════════════════════════════════════════
+// RELAY TREE — распределение стрима (голос/экран) деревом вместо mesh.
+// Стример льёт максимум CONFIG.limits.MAX_RELAY_FANOUT (5) прямых P2P-
+// соединений, каждый получатель, у которого есть "дети" в дереве,
+// ретранслирует полученный трек им дальше. Байты никогда не идут через
+// сервер — сервер только считает топологию (кто кому родитель) и
+// рассылает лёгкие сигнальные события. Дерево отдельное на каждого
+// текущего вещателя (broadcasterId) в канале, т.к. вещателей может
+// быть несколько одновременно (несколько говорящих + шаринг экрана).
+// ═══════════════════════════════════════════════════════════
+
+// RelayTree: { root: userId, nodes: Map<userId, { parentId: string|null, children: string[] }> }
+
+function allChannelMemberIds(channel, excludeId) {
+  const ids = [];
+  channel.speakers.forEach((_, uid) => { if (uid !== excludeId) ids.push(uid); });
+  channel.listeners.forEach((_, uid) => { if (uid !== excludeId) ids.push(uid); });
+  return ids;
+}
+
+// Найти в дереве ближайший (по глубине, чтобы дерево оставалось широким,
+// а не вырождалось в цепочку) узел со свободным слотом. BFS от корня.
+function findFreeSlot(tree) {
+  const queue = [tree.root];
+  const seen = new Set(queue);
+  while (queue.length) {
+    const uid = queue.shift();
+    const node = tree.nodes.get(uid);
+    if (!node) continue;
+    if (node.children.length < CONFIG.limits.MAX_RELAY_FANOUT) return uid;
+    for (const childId of node.children) {
+      if (!seen.has(childId)) { seen.add(childId); queue.push(childId); }
+    }
+  }
+  return null; // дерево полностью заполнено на всех текущих участниках (не должно случаться на практике)
+}
+
+// Построить дерево с нуля для нового вещателя из всех, кто сейчас в канале.
+function buildRelayTree(channel, broadcasterId) {
+  const tree = { root: broadcasterId, nodes: new Map() };
+  tree.nodes.set(broadcasterId, { parentId: null, children: [] });
+  const others = allChannelMemberIds(channel, broadcasterId);
+  for (const uid of others) {
+    const parentId = findFreeSlot(tree);
+    tree.nodes.set(uid, { parentId, children: [] });
+    if (parentId) tree.nodes.get(parentId).children.push(uid);
+  }
+  channel.relayTrees.set(broadcasterId, tree);
+  return tree;
+}
+
+// Новый участник зашёл в канал, пока вещание уже идёт — воткнуть его
+// листом в свободный слот (не перестраивая всё дерево).
+function insertIntoRelayTree(channel, broadcasterId, newUserId) {
+  const tree = channel.relayTrees.get(broadcasterId);
+  if (!tree || tree.nodes.has(newUserId)) return null;
+  const parentId = findFreeSlot(tree);
+  tree.nodes.set(newUserId, { parentId, children: [] });
+  if (parentId) tree.nodes.get(parentId).children.push(newUserId);
+  return { parentId };
+}
+
+// Узел вышел/отключился — его "детей" переподключаем к другому узлу
+// со свободным слотом (сам ушедший узел из дерева удаляется).
+// Возвращает список { childId, newParentId } для рассылки уведомлений.
+function removeFromRelayTree(channel, broadcasterId, leavingUserId) {
+  const tree = channel.relayTrees.get(broadcasterId);
+  if (!tree) return { destroyed: false, reparented: [] };
+
+  // Ушёл сам вещатель — дерево целиком теряет смысл.
+  if (leavingUserId === broadcasterId) {
+    channel.relayTrees.delete(broadcasterId);
+    return { destroyed: true, reparented: [] };
+  }
+
+  const node = tree.nodes.get(leavingUserId);
+  if (!node) return { destroyed: false, reparented: [] };
+
+  // Убираем себя из списка детей родителя
+  if (node.parentId) {
+    const parentNode = tree.nodes.get(node.parentId);
+    if (parentNode) parentNode.children = parentNode.children.filter(id => id !== leavingUserId);
+  }
+  tree.nodes.delete(leavingUserId);
+
+  const reparented = [];
+  for (const childId of node.children) {
+    const childNode = tree.nodes.get(childId);
+    if (!childNode) continue;
+    const newParentId = findFreeSlot(tree);
+    childNode.parentId = newParentId;
+    if (newParentId) tree.nodes.get(newParentId).children.push(childId);
+    reparented.push({ childId, newParentId });
+  }
+  return { destroyed: false, reparented };
+}
+
+function getRelayTreeNode(channel, broadcasterId, userId) {
+  const tree = channel.relayTrees.get(broadcasterId);
+  return tree ? tree.nodes.get(userId) || null : null;
+}
+
+// Полная топология дерева — для визуализатора на клиентах
+function broadcastRelayTopology(io, channel, broadcasterId) {
+  const tree = channel.relayTrees.get(broadcasterId);
+  if (!tree || !io) return;
+  const nodes = [];
+  for (const [uid, node] of tree.nodes) {
+    const u = channel.speakers.get(uid) || channel.listeners.get(uid);
+    nodes.push({ userId: uid, name: u ? u.name : 'User', parentId: node.parentId, children: node.children.slice() });
+  }
+  io.to(channel.id).emit('relay-tree-topology', { broadcasterId, nodes, ts: Date.now() });
+}
+
+function getRelaySocketId(channel, userId) {
+  const s = channel.speakers.get(userId);
+  if (s) return s.socketId;
+  const l = channel.listeners.get(userId);
+  return l ? l.socketId : null;
+}
+
+function isBroadcasterActive(channel, broadcasterId) {
+  const speaking = channelSpeaking.get(channel.id);
+  if (speaking && speaking.has(broadcasterId)) return true;
+  const screens = channelScreenShare.get(channel.id);
+  if (screens && screens.has(broadcasterId) && screens.get(broadcasterId).size > 0) return true;
+  return false;
+}
+
+// Гарантирует, что для broadcasterId есть дерево, и рассылает всем его
+// участникам их позицию (parentId/children). Идемпотентно — если дерево
+// уже построено (например, включили и голос, и экран подряд), просто
+// шлём текущее состояние заново, не перестраивая топологию.
+function ensureRelayTreeAndBroadcast(io, channel, broadcasterId) {
+  let tree = channel.relayTrees.get(broadcasterId);
+  if (!tree) tree = buildRelayTree(channel, broadcasterId);
+  for (const [uid, node] of tree.nodes) {
+    const sid = getRelaySocketId(channel, uid);
+    if (!sid) continue;
+    io.to(sid).emit('relay-tree-init', { broadcasterId, parentId: node.parentId, children: [...node.children] });
+  }
+  broadcastRelayTopology(io, channel, broadcasterId);
+}
+
+// Разбирает дерево, если у broadcasterId больше нет ни голоса, ни экрана.
+function maybeDestroyRelayTree(io, channel, broadcasterId) {
+  if (isBroadcasterActive(channel, broadcasterId)) return;
+  if (!channel.relayTrees.has(broadcasterId)) return;
+  channel.relayTrees.delete(broadcasterId);
+  io.to(channel.id).emit('relay-tree-destroyed', { broadcasterId });
+}
+
+
+
+// Пользователь ушёл (leave-channel / disconnect) — вычищаем его из ВСЕХ
+// деревьев канала, где он мог быть либо корнем (сам вещатель), либо
+// обычным релеем с детьми, и уведомляем задетых.
+function leaveAllRelayTrees(io, channel, userId) {
+  for (const broadcasterId of [...channel.relayTrees.keys()]) {
+    const result = removeFromRelayTree(channel, broadcasterId, userId);
+    if (result.destroyed) {
+      io.to(channel.id).emit('relay-tree-destroyed', { broadcasterId });
+      continue;
+    }
+    for (const { childId, newParentId } of result.reparented) {
+      const childSid = getRelaySocketId(channel, childId);
+      if (childSid) io.to(childSid).emit('relay-tree-reparent', { broadcasterId, newParentId });
+      if (newParentId) {
+        const parentSid = getRelaySocketId(channel, newParentId);
+        if (parentSid) io.to(parentSid).emit('relay-tree-child-added', { broadcasterId, childId });
+      }
+    }
+  }
+  for (const [broadcasterId] of channel.relayTrees) broadcastRelayTopology(io, channel, broadcasterId);
+}
+
+
 
 // ═══════════════════════════════════════════════════════════
 // UTILITIES
@@ -390,6 +594,15 @@ setInterval(() => {
   } catch (err) { console.error('❌ Expiry error:', err.message); }
 }, 60000);
 
+// Топология каскада: гарантированная досылка (дешёвый payload, ≤40 узлов)
+setInterval(() => {
+  try {
+    channels.forEach((ch) => {
+      if (ch.relayTrees?.size) for (const [bid] of ch.relayTrees) broadcastRelayTopology(io, ch, bid);
+    });
+  } catch (e) {}
+}, 7000);
+
 setInterval(() => {
   try {
     channels.forEach((ch) => { federation.broadcastChannelUpdated(ch); });
@@ -460,6 +673,15 @@ io.on('connection', (socket) => {
     socket._userId = persistentId;
     socket._registered = true;
     socket._publicKeyJWK = publicKeyJWK;
+    onlineUsers.set(persistentId, socket.id);
+
+    // Доставляем то, что накопилось, пока пользователь был не в сети.
+    const queued = pendingDMs.get(persistentId);
+    if (queued && queued.length) {
+      queued.forEach(m => { try { socket.emit('dm-message-received', m); } catch(e) {} });
+      pendingDMs.delete(persistentId);
+    }
+
     cb({ success: true, userId: persistentId });
   }));
 
@@ -475,9 +697,21 @@ io.on('connection', (socket) => {
     } catch (err) { next(new Error('Security check failed')); }
   });
 
-  socket.on('get-channels', safeHandler('get-channels', (cb) => {
-    cb(federation.getGlobalChannelList());
-  }));
+    socket.on('get-channels', safeHandler('get-channels', (cb) => {
+        const userData = users.get(socket.id);
+        const list = federation.getGlobalChannelList()
+            .map(ch => {
+                const local = channels.get(ch.id);
+                if (local) ch.hidden = !!local.hidden;
+                return ch;
+            })
+            .filter(ch => {
+                if (!ch.hidden) return true;
+                // Скрытый канал видят только его текущие участники
+                return userData && userData.channelId === ch.id;
+            });
+        cb(list);
+    }));
 
   socket.on('create-channel', safeHandler('create-channel', async (rawData, cb) => {
     const callback = typeof cb === 'function' ? cb : () => {};
@@ -519,6 +753,7 @@ io.on('connection', (socket) => {
       created: Date.now(), chest: [], deleteTimer: null,
       approvedUsers: new Set(),
       persistentSpeakers: new Set(),
+      relayTrees: new Map(), // broadcasterId -> RelayTree
       aesKey: crypto.randomBytes(32)
     };
     channels.set(channelId, channel);
@@ -616,15 +851,17 @@ io.on('connection', (socket) => {
     const activeStreamers = [];
     const screenSharers = channelScreenShare.get(channelId);
     if (screenSharers) {
-      screenSharers.forEach(uid => {
+      screenSharers.forEach((mediaTypes, uid) => {
         const u = channel.speakers.get(uid) || channel.listeners.get(uid);
-        if (u) activeStreamers.push({ userId: uid, userName: u.name });
+        if (u && mediaTypes.size > 0) {
+          activeStreamers.push({ userId: uid, userName: u.name, mediaTypes: [...mediaTypes] });
+        }
       });
     }
 
     callback({
       success: true, channelName: channel.name, isAdmin: role === 'admin', role,
-      requireApproval: channel.requireApproval, adminId: channel.admin,
+      requireApproval: channel.requireApproval, hidden: channel.hidden || false, adminId: channel.admin,
       speakers: speakersList, listeners: listenersList,
       messages: (channel.messages || []).slice(-100),
       maxSpeakers: CONFIG.limits.MAX_SPEAKERS, maxListeners: CONFIG.limits.MAX_LISTENERS,
@@ -633,13 +870,41 @@ io.on('connection', (socket) => {
       totalLikes: channel.totalLikes || 0,
       raisedHands: raisedHandsList, joinRequests: joinRequestsList,
       chestFiles: channel.chest || [], chestLocked: channel.chestLocked || false,
-      streamers: activeStreamers
+      streamers: activeStreamers,
+      sharedFolders: Object.fromEntries(
+        [...userShares.entries()]
+          .filter(([uid, s]) => allChannelMemberIds(channel).includes(uid) &&
+            (s.visibility === 'channel' || s.targets.includes(userId) || uid === userId))
+          .map(([uid, s]) => [uid, s])
+      ),
+      seedStats: Object.fromEntries([...userSeedStats.entries()])
     });
 
     cancelChannelDeletion(channelId);
     socket.to(channelId).emit('user-joined', { userId, userName: uniqueName, role });
     if (nameChanged) socket.emit('name-changed-by-server', { newName: uniqueName, reason: 'Name taken' });
-    
+    activeStreamers.forEach(s => {
+      s.mediaTypes.forEach(mt => {
+        socket.emit('screen-share-started', { userId: s.userId, userName: s.userName, mediaType: mt });
+      });
+    });
+
+    // Кто-то уже вещает в этом канале — сразу встраиваем новичка в дерево
+    // раздачи листом со свободным слотом, а не заставляем ждать следующего
+    // полного пересбора. Именно это покрывает "подключились в любой момент".
+    for (const [broadcasterId] of channel.relayTrees) {
+      if (broadcasterId === userId) continue;
+      const result = insertIntoRelayTree(channel, broadcasterId, userId);
+      if (!result) continue;
+      socket.emit('relay-tree-init', { broadcasterId, parentId: result.parentId, children: [] });
+      if (result.parentId) {
+        const parentSid = getRelaySocketId(channel, result.parentId);
+        if (parentSid) io.to(parentSid).emit('relay-tree-child-added', { broadcasterId, childId: userId });
+      }
+    }
+
+    for (const [broadcasterId] of channel.relayTrees) broadcastRelayTopology(io, channel, broadcasterId);
+
     federation.broadcastChannelUpdated(channel);
     log('👤', `${uniqueName} → "${channel.name}" as ${role}`);
   }));
@@ -768,6 +1033,9 @@ io.on('connection', (socket) => {
     channel.recentlyApproved?.delete(userData.userId);
     channelSpeaking.get(channelId)?.delete(userData.userId);
     channelScreenShare.get(channelId)?.delete(userData.userId);
+    leaveAllRelayTrees(io, channel, userData.userId);
+    userShares.delete(userData.userId);
+    if (userData.channelId) io.to(userData.channelId).emit('share-removed', { userId: userData.userId });
     socket.leave(channelId);
     userData.channelId = null; userData.role = null;
     socket.to(channelId).emit('user-left', { userId: userData.userId, userName: name });
@@ -842,6 +1110,12 @@ io.on('connection', (socket) => {
       text: text || '',
       timestamp: Date.now()
     };
+    // Эхаем clientId обратно — так клиент может сверить это подтверждение
+    // с уже показанным локально сообщением (офлайн-очередь / P2P-relay в звонке)
+    // и не рисовать дубликат.
+    if (data.clientId && typeof data.clientId === 'string') {
+      msg.clientId = sanitize(data.clientId, 40);
+    }
     if (data.encrypted) msg.encrypted = data.encrypted;
     if (data.replyTo && typeof data.replyTo === 'object') {
       msg.replyTo = {
@@ -978,22 +1252,49 @@ io.on('connection', (socket) => {
     if (data.isSpeaking) channelSpeaking.get(chId).add(userData.userId);
     else channelSpeaking.get(chId).delete(userData.userId);
     socket.to(chId).emit('user-speaking', { userId: userData.userId, userName: userData.userName, isSpeaking: !!data.isSpeaking });
+
+    const channel = channels.get(chId);
+    if (channel) {
+      if (data.isSpeaking) ensureRelayTreeAndBroadcast(io, channel, userData.userId);
+      else maybeDestroyRelayTree(io, channel, userData.userId);
+    }
   }));
 
   socket.on('screen-share-start', safeHandler('screen-share-start', (rawData) => {
     const data = safeData(rawData);
     const userData = users.get(socket.id);
     if (!userData) return;
-    if (!channelScreenShare.has(userData.channelId)) channelScreenShare.set(userData.channelId, new Set());
-    channelScreenShare.get(userData.channelId).add(userData.userId);
-    socket.to(userData.channelId).emit('screen-share-started', { userId: userData.userId, userName: userData.userName, mediaType: data.mediaType || 'screen' });
+    const mt = data.mediaType || 'screen';
+    // channelScreenShare: channelId -> Map(userId -> Set(mediaType)). Раньше
+    // это был плоский Set<userId> без привязки к media type — если у юзера
+    // одновременно шли и камера, и экран, а он останавливал только один из
+    // них, весь его "стриминг"-статус стирался целиком (см. фикс ниже в
+    // screen-share-stop).
+    if (!channelScreenShare.has(userData.channelId)) channelScreenShare.set(userData.channelId, new Map());
+    const chMap = channelScreenShare.get(userData.channelId);
+    if (!chMap.has(userData.userId)) chMap.set(userData.userId, new Set());
+    chMap.get(userData.userId).add(mt);
+    socket.to(userData.channelId).emit('screen-share-started', { userId: userData.userId, userName: userData.userName, mediaType: mt });
+
+    const channel = channels.get(userData.channelId);
+    if (channel) ensureRelayTreeAndBroadcast(io, channel, userData.userId);
   }));
 
-  socket.on('screen-share-stop', safeHandler('screen-share-stop', () => {
+  socket.on('screen-share-stop', safeHandler('screen-share-stop', (rawData) => {
     const userData = users.get(socket.id);
     if (!userData) return;
-    channelScreenShare.get(userData.channelId)?.delete(userData.userId);
-    socket.to(userData.channelId).emit('screen-share-stopped', { userId: userData.userId });
+    const data = safeData(rawData) || {};
+    const mt = data.mediaType;
+    const chMap = channelScreenShare.get(userData.channelId);
+    if (chMap && chMap.has(userData.userId)) {
+      const set = chMap.get(userData.userId);
+      if (mt) set.delete(mt); else set.clear();
+      if (set.size === 0) chMap.delete(userData.userId);
+    }
+    socket.to(userData.channelId).emit('screen-share-stopped', { userId: userData.userId, mediaType: mt });
+
+    const channel = channels.get(userData.channelId);
+    if (channel) maybeDestroyRelayTree(io, channel, userData.userId);
   }));
 
   socket.on('request-stream-resend', safeHandler('request-stream-resend', (rawData) => {
@@ -1144,6 +1445,21 @@ io.on('connection', (socket) => {
     federation.broadcastChannelUpdated(channel);
     cb({ success: true, requireApproval: channel.requireApproval });
   }));
+  
+    socket.on('toggle-channel-hidden', safeHandler('toggle-channel-hidden', (rawData, cb) => {
+        const callback = typeof cb === 'function' ? cb : () => {};
+        const userData = users.get(socket.id);
+        if (!userData) return callback({ error: 'Not connected' });
+        const channel = channels.get(userData.channelId);
+        if (!channel || channel.admin !== userData.userId) return callback({ error: 'Admin only' });
+        channel.hidden = !channel.hidden;
+        io.to(userData.channelId).emit('channel-hidden-changed', { hidden: channel.hidden, changedBy: userData.userName });
+        federation.broadcastChannelUpdated(channel);
+        io.emit('channels-updated');
+        io.emit('federation-channels-updated', federation.getGlobalChannelList());
+        callback({ success: true, hidden: channel.hidden });
+        log(channel.hidden ? '🙈' : '👁️', `"${channel.name}" ${channel.hidden ? 'скрыт из списка' : 'снова виден в списке'}`);
+    }));
 
   socket.on('close-channel', safeHandler('close-channel', (rawData, cb) => {
     const userData = users.get(socket.id);
@@ -1318,6 +1634,21 @@ io.on('connection', (socket) => {
     
     cb({ success: true, callId });
     log('📞', `Call created: ${callId} by ${userData.userName} (${participants.size} participants)`);
+  }));
+  
+  socket.on('get-shared-folders', safeHandler('get-shared-folders', (cb) => {
+    const userData = users.get(socket.id);
+    if (!userData?.channelId) return typeof cb === 'function' && cb({ folders: {} });
+    const channel = channels.get(userData.channelId);
+    if (!channel) return typeof cb === 'function' && cb({ folders: {} });
+    
+    const folders = Object.fromEntries(
+      [...userShares.entries()]
+        .filter(([uid, s]) => allChannelMemberIds(channel).includes(uid) &&
+          (s.visibility === 'channel' || s.targets.includes(userData.userId) || uid === userData.userId))
+        .map(([uid, s]) => [uid, { ...s, userName: (channel.speakers.get(uid) || channel.listeners.get(uid))?.name || 'User' }])
+    );
+    if (typeof cb === 'function') cb({ folders });
   }));
 
   socket.on('call-accept', safeHandler('call-accept', (rawData) => {
@@ -1522,6 +1853,59 @@ io.on('connection', (socket) => {
       }
     });
   }));
+  
+    socket.on('dm-message', safeHandler('dm-message', (rawData) => {
+        const data = safeData(rawData);
+        const fromUserId = socket._userId;
+        if (!fromUserId) return; // не зарегистрирован через register-persistent
+
+        if (!checkMessageRate(fromUserId)) return;
+
+        const toUserId = sanitize(data.toUserId, 40);
+        if (!toUserId) return;
+
+        const text = sanitize(data.text, 2000);
+        // media.url — это base64 data URL, через sanitize() (обрезает <> и
+        // длину) его пускать нельзя — испортит данные. Валидируем остальные
+        // поля, url пропускаем как есть.
+        const media = (data.media && typeof data.media === 'object' && typeof data.media.url === 'string')
+          ? {
+              type: sanitize(data.media.type, 20) || 'file',
+              name: sanitize(data.media.name, 200) || 'file',
+              size: Number(data.media.size) || 0,
+              url: data.media.url
+            }
+          : null;
+        // Раньше: пустой text отбрасывал ВСЁ сообщение целиком, включая
+        // прикреплённый media (например, файл/фото без подписи) — из-за
+        // этого DM с вложениями молча не доходили.
+        if (!text && !media) return;
+
+        const userData = users.get(socket.id);
+        const fromUserName = userData?.userName || sanitize(data.fromUserName, 60) || 'User';
+
+        const payload = {
+            fromUserId, fromUserName, text,
+            media: media || undefined,
+            msgId: data.msgId,
+            timestamp: data.timestamp || Date.now()
+        };
+
+        const targetSocketId = onlineUsers.get(toUserId);
+        const targetSocket = targetSocketId && io.sockets.sockets.get(targetSocketId);
+        if (targetSocket) {
+            io.to(targetSocketId).emit('dm-message-received', payload);
+        } else {
+            // Получатель сейчас не в сети (или не в канале — раньше DM вообще
+            // не находил его через findUser() в этом случае и терял
+            // сообщение). Ставим в очередь, доставим при следующем
+            // register-persistent.
+            if (!pendingDMs.has(toUserId)) pendingDMs.set(toUserId, []);
+            const q = pendingDMs.get(toUserId);
+            q.push(payload);
+            if (q.length > MAX_PENDING_DMS_PER_USER) q.shift();
+        }
+    }));
 
   // ═══════════════════════════════════════════════════════════
   // DISCONNECT
@@ -1534,6 +1918,7 @@ io.on('connection', (socket) => {
       socketRates.delete(socket.id);
       joinCooldowns.delete(socket.id);
       relayHelpers.delete(socket.id);
+      if (socket._userId && onlineUsers.get(socket._userId) === socket.id) onlineUsers.delete(socket._userId);
 
       // Cleanup from active calls
       const userData = users.get(socket.id);
@@ -1569,6 +1954,9 @@ io.on('connection', (socket) => {
       channel.recentlyApproved?.delete(userData.userId);
       channelSpeaking.get(userData.channelId)?.delete(userData.userId);
       channelScreenShare.get(userData.channelId)?.delete(userData.userId);
+      leaveAllRelayTrees(io, channel, userData.userId);
+      userShares.delete(userData.userId);
+      if (userData.channelId) io.to(userData.channelId).emit('share-removed', { userId: userData.userId });
       if (channel.speakers.size === 0 && channel.listeners.size === 0) scheduleChannelDeletion(userData.channelId);
       else socket.to(userData.channelId).emit('user-left', { userId: userData.userId, userName: userData.userName });
       users.delete(socket.id);
@@ -1576,6 +1964,99 @@ io.on('connection', (socket) => {
       federation.broadcastChannelUpdated(channel);
     } catch (err) { console.error('❌ disconnect:', err); }
   });
+  
+  socket.on('update-share', safeHandler('update-share', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData?.channelId) return;
+    
+    const files = (data.files || []).slice(0, 1000).map(f => ({
+      id: sanitize(f.id, 40), name: sanitize(f.name, 255),
+      size: Number(f.size) || 0, type: sanitize(f.type, 100), path: sanitize(f.path, 500),
+      visibility: f.visibility === 'private' ? 'private' : 'channel'
+    })).filter(f => f.id && f.name && f.size > 0);
+    
+    // Проверка квот (макс 10 ГБ на пользователя)
+    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+    if (totalSize > 10 * 1024 * 1024 * 1024) {
+      return socket.emit('error', { message: 'Quota exceeded (10GB max)' });
+    }
+    
+    const entry = {
+      files,
+      folderName: sanitize(data.folderName, 60) || 'Shared',
+      visibility: data.visibility === 'private' ? 'private' : 'channel',
+      targets: (data.targets || []).slice(0, 40).map(sanitize),
+      updated: Date.now()
+    };
+    
+    userShares.set(userData.userId, entry);
+    
+    const channel = channels.get(userData.channelId);
+    if (channel) {
+      const recipients = entry.visibility === 'private'
+        ? [...entry.targets, userData.userId]
+        : allChannelMemberIds(channel);
+        
+      recipients.forEach(uid => {
+        const sid = getRelaySocketId(channel, uid);
+        if (sid) io.to(sid).emit('share-updated', { userId: userData.userId, userName: userData.userName, ...entry });
+      });
+    }
+  }));
+  
+  socket.on('remove-share', safeHandler('remove-share', () => {
+    const userData = users.get(socket.id);
+    if (!userData?.channelId) return;
+    userShares.delete(userData.userId);
+    const channel = channels.get(userData.channelId);
+    if (channel) io.to(userData.channelId).emit('share-removed', { userId: userData.userId });
+  }));
+  
+  socket.on('request-share-file', safeHandler('request-share-file', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData?.channelId) return;
+    
+    const channel = channels.get(userData.channelId);
+    const owner = findUser(data.ownerId);
+    if (!owner || !channel) return;
+    
+    const share = userShares.get(data.ownerId);
+    if (!share) return;
+    
+    // Приватный доступ: только targets или владелец
+    if (share.visibility === 'private' && userData.userId !== data.ownerId && !share.targets.includes(userData.userId)) {
+      socket.emit('share-file-denied', { fileId: data.fileId, reason: 'private' });
+      return;
+    }
+    
+    io.to(owner.socketId).emit('share-file-requested', {
+      fileId: data.fileId, requesterId: userData.userId, requesterName: userData.userName
+    });
+  }));
+  
+  socket.on('update-seed-stats', safeHandler('update-seed-stats', (rawData) => {
+    const data = safeData(rawData);
+    const userData = users.get(socket.id);
+    if (!userData?.channelId) return;
+    const cur = userSeedStats.get(userData.userId) || { bytesGiven: 0, filesGiven: 0 };
+    cur.bytesGiven += Number(data.bytes) || 0;
+    cur.filesGiven += Number(data.count) || 0;
+    cur.achievements = getSeedAchievements(cur.bytesGiven, cur.filesGiven);
+    userSeedStats.set(userData.userId, cur);
+    io.to(userData.channelId).emit('seed-stats-updated', {
+      userId: userData.userId, ...cur
+    });
+  }));
+  
+  socket.on('get-seed-stats', safeHandler('get-seed-stats', (rawData, cb) => {
+    const data = safeData(rawData || {});
+    const targetId = data.userId || socket._userId;
+    const stats = userSeedStats.get(targetId) || { bytesGiven: 0, filesGiven: 0, achievements: [] };
+    if (typeof cb === 'function') cb(stats);
+  }));
+
 
 }); // ← конец io.on('connection')
 
